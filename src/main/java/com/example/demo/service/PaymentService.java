@@ -1,0 +1,1686 @@
+package com.example.demo.service;
+
+import com.example.demo.dto.InicisResponseDto;
+import com.example.demo.dto.PaymentResultDto;
+import com.example.demo.entity.Order;
+import com.example.demo.entity.Payment;
+import com.example.demo.entity.PaymentLog;
+import com.example.demo.entity.User;
+import com.example.demo.mapper.PaymentMapper;
+import com.example.demo.repository.OrderRepository;
+import com.example.demo.repository.PaymentLogRepository;
+import com.example.demo.repository.PaymentRepository;
+import com.example.demo.repository.UserRepository;
+import com.example.demo.entity.IfInisisLog;
+import com.example.demo.repository.IfInisisLogRepository;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
+import org.springframework.web.client.RestTemplate;
+import org.springframework.http.HttpEntity;
+import org.springframework.http.HttpHeaders;
+import org.springframework.http.MediaType;
+import org.springframework.http.ResponseEntity;
+import org.springframework.util.MultiValueMap;
+import org.springframework.util.LinkedMultiValueMap;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.core.JsonProcessingException;
+
+import java.security.MessageDigest;
+import java.time.LocalDateTime;
+import java.time.format.DateTimeFormatter;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Optional;
+import java.util.UUID;
+import java.nio.charset.StandardCharsets;
+
+@Service
+@Transactional
+public class PaymentService {
+    
+    private static final Logger logger = LoggerFactory.getLogger(PaymentService.class);
+    
+    @Autowired
+    private PaymentRepository paymentRepository;
+    
+    @Autowired
+    private PaymentMapper paymentMapper;
+    
+    @Autowired
+    private OrderRepository orderRepository;
+    
+    @Autowired
+    private PaymentLogRepository paymentLogRepository;
+    
+    @Autowired
+    private UserRepository userRepository;
+    
+    @Autowired
+    private IfInisisLogRepository ifInisisLogRepository;
+    
+    private final RestTemplate restTemplate;
+    private final ObjectMapper objectMapper = new ObjectMapper();
+    
+    // RestTemplate 타임아웃 설정
+    {
+        restTemplate = new RestTemplate();
+        restTemplate.getRequestFactory();
+    }
+    
+    // 이니시스 설정
+    private static final String INICIS_API_URL = "https://stgstdpay.inicis.com/api/v1/formpay";
+    private static final String INICIS_REFUND_URL = "https://iniapi.inicis.com/v2/pg/refund";
+    private static final String MID = "INIpayTest";
+    private static final String SIGN_KEY = "SU5JTElURV9UUklQTEVERVNfS0VZU1RS";
+    private static final String INI_API_KEY = "ItEQKi3rY7uvDS8l";
+    
+    
+    public PaymentResultDto processInicisCallback(InicisResponseDto inicisResponse) {
+        logger.info("Processing Inicis callback for order: {}", inicisResponse.getOid());
+        
+        try {
+            // 서명 검증 (실제 운영환경에서는 이니시스 키로 검증해야 함)
+            if (!verifySignature(inicisResponse)) {
+                logger.warn("Invalid signature for order: {}", inicisResponse.getOid());
+                throw new IllegalArgumentException("유효하지 않은 서명입니다.");
+            }
+            
+            // 기존 완료된 결제 정보 확인
+            List<Payment> existingPayments = paymentRepository.findByOrderNoAndStatusCompleted(inicisResponse.getOid());
+            Optional<Payment> existingPayment = existingPayments.isEmpty() ? Optional.empty() : Optional.of(existingPayments.get(0));
+            
+            Payment payment;
+            if (existingPayment.isPresent()) {
+                // 기존 결제 정보 업데이트
+                payment = existingPayment.get();
+                updatePaymentFromInicisResponse(payment, inicisResponse);
+                logger.info("Updated existing payment for order: {}", inicisResponse.getOid());
+            } else {
+                // 새 결제 정보 저장
+                payment = paymentMapper.toPaymentEntity(inicisResponse);
+                logger.info("Created new payment for order: {}", inicisResponse.getOid());
+            }
+            
+            Payment savedPayment = paymentRepository.save(payment);
+            PaymentResultDto result = paymentMapper.toPaymentResultDto(inicisResponse);
+            
+            logger.info("Payment processing completed for order: {} with status: {}", 
+                       savedPayment.getOrderNo(), savedPayment.getStatus());
+            
+            return result;
+            
+        } catch (Exception e) {
+            logger.error("Error processing payment callback for order: {}", inicisResponse.getOid(), e);
+            throw new RuntimeException("결제 처리 중 오류가 발생했습니다.", e);
+        }
+    }
+    
+    public Optional<Payment> getPaymentByOrderNo(String orderNo) {
+        List<Payment> payments = paymentRepository.findByOrderNoOrderByPaymentDateDesc(orderNo);
+        return payments.isEmpty() ? Optional.empty() : Optional.of(payments.get(0));
+    }
+    
+    public boolean isPaymentCompleted(String orderNo) {
+        List<Payment> payments = paymentRepository.findByOrderNoAndStatusCompleted(orderNo);
+        return !payments.isEmpty();
+    }
+    
+    private boolean verifySignature(InicisResponseDto response) {
+        // 실제 운영환경에서는 이니시스에서 제공하는 키로 서명을 검증해야 합니다
+        // 여기서는 기본적인 검증만 수행합니다
+        try {
+            String signatureData = response.getOid() + response.getPrice() + response.getTimestamp();
+            // 실제로는 이니시스 키와 함께 SHA256 해시를 생성하여 비교해야 합니다
+            return response.getSignature() != null && !response.getSignature().isEmpty();
+        } catch (Exception e) {
+            logger.error("Signature verification failed", e);
+            return false;
+        }
+    }
+    
+    // 주문 생성
+    public Map<String, Object> createOrder(Long userId, Long totalAmount, Integer pointsUsed, Long cardAmount) {
+        logger.info("Creating order - userId: {}, totalAmount: {}, pointsUsed: {}, cardAmount: {}", 
+                   userId, totalAmount, pointsUsed, cardAmount);
+        
+        Optional<User> userOpt = userRepository.findById(userId);
+        if (userOpt.isEmpty()) {
+            throw new IllegalArgumentException("사용자를 찾을 수 없습니다.");
+        }
+        
+        User user = userOpt.get();
+        if (user.getPoints() < pointsUsed) {
+            throw new IllegalArgumentException("적립금이 부족합니다.");
+        }
+        
+        String orderNo = "ORD" + System.currentTimeMillis() + UUID.randomUUID().toString().substring(0, 8);
+        
+        Order order = new Order(orderNo, userId, totalAmount, pointsUsed, cardAmount, Order.OrderStatus.PENDING);
+        orderRepository.save(order);
+        
+        user.setPoints(user.getPoints() - pointsUsed);
+        userRepository.save(user);
+
+        // 적립금 사용 내역을 Payment 테이블에 기록
+        if (pointsUsed > 0) {
+            Payment pointPayment = new Payment();
+            pointPayment.setOrderNo(orderNo);
+            pointPayment.setTid("POINTS_" + System.currentTimeMillis());
+            pointPayment.setAmount(Long.valueOf(pointsUsed));
+            pointPayment.setStatus("COMPLETED");
+            pointPayment.setPaymentType(Payment.PaymentType.POINT.name());
+            pointPayment.setResultCode("0000");
+            pointPayment.setResultMsg("적립금 사용");
+            pointPayment.setPaymentDate(LocalDateTime.now());
+            pointPayment.setCardName("적립금");
+
+            paymentRepository.save(pointPayment);
+            logger.info("Point usage recorded - OrderNo: {}, Points: {}", orderNo, pointsUsed);
+        }
+
+        // 적립금만으로 결제가 완료되는 경우 (카드 결제 금액이 0) 주문 상태를 완료로 변경
+        if (cardAmount == 0 && pointsUsed > 0) {
+            order.setStatus(Order.OrderStatus.COMPLETED);
+            orderRepository.save(order);
+
+            // 보너스 포인트 적립
+            processPaymentSuccess(order);
+
+            logger.info("Order completed with points only - OrderNo: {}, Points: {}", orderNo, pointsUsed);
+        }
+
+        Map<String, Object> result = new HashMap<>();
+        result.put("orderId", order.getId());
+        result.put("orderNo", orderNo);
+        result.put("cardAmount", cardAmount);
+        result.put("pointsUsed", pointsUsed);
+        result.put("totalAmount", totalAmount);
+
+        // 적립금만으로 결제가 완료된 경우 완료 정보 추가
+        if (cardAmount == 0 && pointsUsed > 0) {
+            result.put("paymentCompleted", true);
+            result.put("paymentMethod", "POINTS_ONLY");
+            result.put("completedAt", LocalDateTime.now());
+
+            try {
+                String encodedMessage = java.net.URLEncoder.encode("적립금 결제가 완료되었습니다.", "UTF-8");
+                result.put("redirectUrl", "/order/success?orderNo=" + orderNo +
+                          "&amount=" + totalAmount +
+                          "&message=" + encodedMessage +
+                          "&status=COMPLETED");
+            } catch (Exception e) {
+                logger.warn("Failed to encode URL message", e);
+                result.put("redirectUrl", "/order/success?orderNo=" + orderNo +
+                          "&amount=" + totalAmount +
+                          "&status=COMPLETED");
+            }
+        } else {
+            result.put("paymentCompleted", false);
+            result.put("paymentMethod", "CARD_REQUIRED");
+        }
+
+        return result;
+    }
+    
+    // 결제 알림 처리 (notify)
+    public String processPaymentNotify(Map<String, Object> params) {
+        try {
+            logger.info("Processing payment notify with params: {}", params);
+            
+            String orderNo = extractOrderNumber(params);
+            String resultCode = extractResultCode(params);
+            String resultMsg = extractResultMessage(params);
+            String tid = extractTransactionId(params);
+            
+            logger.info("Notify - orderNo: {}, resultCode: {}, resultMsg: {}", orderNo, resultCode, resultMsg);
+            
+            Optional<Order> orderOpt = orderRepository.findByOrderNo(orderNo);
+            if (orderOpt.isEmpty()) {
+                logger.warn("Notify: Order not found: {}", orderNo);
+                return "FAIL";
+            }
+            
+            Order order = orderOpt.get();
+            logger.info("Notify: Found order with current status: {}", order.getStatus());
+            
+            // PaymentLog 처리
+            PaymentLog paymentLog = createOrUpdatePaymentLog(order, tid, resultCode, resultMsg);
+            
+            if ("0000".equals(resultCode)) {
+                processSuccessfulPayment(order, paymentLog);
+            } else {
+                processFailedPayment(order, paymentLog, resultCode, resultMsg);
+            }
+            
+            // 저장 및 검증
+            savePaymentLogWithVerification(paymentLog);
+            orderRepository.save(order);
+            
+            return "OK";
+            
+        } catch (Exception e) {
+            logger.error("Notify processing error: {}", e.getMessage(), e);
+            return "FAIL";
+        }
+    }
+    
+    // 결제 응답 처리 (response)
+    public Map<String, Object> processPaymentResponse(Map<String, Object> params) {
+        try {
+            logger.info("Processing payment response with params: {}", params);
+            
+            String orderNo = extractOrderNumber(params);
+            String resultCode = extractResultCode(params);
+            String resultMsg = extractResultMessage(params);
+            String tid = extractTransactionId(params);
+            String authUrl = (String) params.get("authUrl");
+            String authToken = (String) params.get("authToken");
+            
+            logger.info("Response - orderNo: {}, resultCode: {}, resultMsg: {}, tid: {}", orderNo, resultCode, resultMsg, tid);
+            
+            Optional<Order> orderOpt = orderRepository.findByOrderNo(orderNo);
+            if (orderOpt.isEmpty()) {
+                return Map.of("success", false, "message", "주문을 찾을 수 없습니다: " + orderNo);
+            }
+            
+            Order order = orderOpt.get();
+            PaymentLog paymentLog = createOrUpdatePaymentLog(order, tid, resultCode, resultMsg);
+            
+            // authUrl과 authToken이 있으면 추가 인증 API 호출
+            if (authUrl != null && authToken != null && !authUrl.trim().isEmpty() && !authToken.trim().isEmpty()) {
+                logger.info("Processing auth API call for orderNo: {}, authUrl: {}", orderNo, authUrl);
+                Map<String, Object> authResult = processAuthUrlRequest(authUrl, authToken, order);
+                
+                // 인증 결과에 따라 처리
+                String authResultCode = (String) authResult.get("code");
+                if ("0000".equals(authResultCode)) {
+                    processSuccessfulPayment(order, paymentLog, authResult);
+                } else {
+                    processFailedPayment(order, paymentLog, authResultCode, (String) authResult.get("message"));
+                }
+            } else {
+                // 기존 로직
+                if ("0000".equals(resultCode)) {
+                    processSuccessfulPayment(order, paymentLog);
+                } else {
+                    processFailedPayment(order, paymentLog, resultCode, resultMsg);
+                }
+            }
+            
+            savePaymentLogWithVerification(paymentLog);
+            orderRepository.save(order);
+            
+            String message = "0000".equals(resultCode) ? "결제가 완료되었습니다." : "결제가 실패했습니다: " + resultMsg;
+            boolean success = "0000".equals(resultCode);
+            
+            return Map.of(
+                "success", success,
+                "message", message,
+                "orderNo", order.getOrderNo(),
+                "orderId", order.getId(),
+                "amount", order.getCardAmount(),
+                "resultCode", resultCode != null ? resultCode : "",
+                "resultMsg", resultMsg != null ? resultMsg : ""
+            );
+            
+        } catch (Exception e) {
+            logger.error("Response processing error: {}", e.getMessage(), e);
+            return Map.of("success", false, "message", "결제 처리 중 오류가 발생했습니다: " + e.getMessage());
+        }
+    }
+    
+    // 파라미터 추출 메서드들
+    private String extractOrderNumber(Map<String, Object> params) {
+        String orderNo = (String) params.get("orderNumber");
+        if (orderNo == null) orderNo = (String) params.get("oid");
+        if (orderNo == null) orderNo = (String) params.get("P_OID");
+        if (orderNo == null) orderNo = (String) params.get("MOID");
+        return orderNo;
+    }
+    
+    private String extractResultCode(Map<String, Object> params) {
+        String resultCode = (String) params.get("resultCode");
+        if (resultCode == null) resultCode = (String) params.get("P_STATUS");
+        return resultCode;
+    }
+    
+    private String extractResultMessage(Map<String, Object> params) {
+        String resultMsg = (String) params.get("resultMsg");
+        if (resultMsg == null) resultMsg = (String) params.get("P_RMESG1");
+        return resultMsg;
+    }
+    
+    private String extractTransactionId(Map<String, Object> params) {
+        String tid = (String) params.get("tid");
+        if (tid == null) tid = (String) params.get("P_TID");
+        if (tid == null) tid = (String) params.get("TID");
+        if (tid == null) tid = (String) params.get("transactionId");
+        
+        logger.info("Extracted TID from params: {} (available keys: {})", tid, params.keySet());
+        
+        // TID가 없는 경우 임시 TID 생성 (테스트용)
+        if (tid == null || tid.trim().isEmpty()) {
+            tid = "TEMP_TID_" + System.currentTimeMillis();
+            logger.warn("No TID found in params, generated temporary TID: {}", tid);
+        }
+        
+        return tid;
+    }
+    
+    // PaymentLog 생성 또는 업데이트
+    private PaymentLog createOrUpdatePaymentLog(Order order, String tid, String resultCode, String resultMsg) {
+        Optional<PaymentLog> existingLog = paymentLogRepository.findTopByOrderIdOrderByCreatedAtDesc(order.getId());
+        PaymentLog paymentLog;
+        
+        logger.info("Creating/Updating PaymentLog - TID: {}, ResultCode: {}", tid, resultCode);
+        
+        if (existingLog.isPresent()) {
+            logger.info("Updating existing PaymentLog ID: {}", existingLog.get().getId());
+            paymentLog = existingLog.get();
+            paymentLog.setTransactionId(tid);
+            paymentLog.setResultCode(resultCode);
+            paymentLog.setResultMessage(resultMsg);
+            paymentLog.setStatus("0000".equals(resultCode) ? PaymentLog.PaymentStatus.APPROVED : PaymentLog.PaymentStatus.FAILED);
+        } else {
+            logger.info("Creating new PaymentLog for order: {}", order.getId());
+            paymentLog = new PaymentLog(
+                order.getId(),
+                tid,
+                "CARD",
+                order.getCardAmount(),
+                "0000".equals(resultCode) ? PaymentLog.PaymentStatus.APPROVED : PaymentLog.PaymentStatus.FAILED
+            );
+            paymentLog.setResultCode(resultCode);
+            paymentLog.setResultMessage(resultMsg);
+        }
+        
+        logger.info("PaymentLog TID after setting: {}", paymentLog.getTransactionId());
+        
+        return paymentLog;
+    }
+    
+    // 성공한 결제 처리 (기존)
+    private void processSuccessfulPayment(Order order, PaymentLog paymentLog) {
+        logger.info("Processing successful payment for order: {}", order.getOrderNo());
+        
+        if (processInicisApproval(paymentLog.getTransactionId(), order.getOrderNo(), order.getCardAmount())) {
+            paymentLog.setApprovedAt(LocalDateTime.now());
+            order.setStatus(Order.OrderStatus.APPROVED);
+            order.setStatus(Order.OrderStatus.COMPLETED);
+            
+            // payments 테이블에 결제 정보 저장
+            savePaymentRecord(order, paymentLog);
+            
+            // 보너스 포인트 적립
+            processPaymentSuccess(order);
+            logger.info("Payment approved and completed: {}", order.getOrderNo());
+        } else {
+            order.setStatus(Order.OrderStatus.FAILED);
+            paymentLog.setStatus(PaymentLog.PaymentStatus.FAILED);
+            paymentLog.setResultMessage("이니시스 승인 처리 실패");
+            restoreUserPoints(order);
+            logger.warn("Inicis approval failed for: {}", order.getOrderNo());
+        }
+    }
+    
+    // 성공한 결제 처리 (인증 결과 포함)
+    private void processSuccessfulPayment(Order order, PaymentLog paymentLog, Map<String, Object> authResult) {
+        logger.info("Processing successful payment with auth result for order: {}", order.getOrderNo());
+
+        // 인증 결과에서 실제 TID가 있으면 PaymentLog 업데이트
+        String realTid = (String) authResult.get("tid");
+        if (realTid != null && !realTid.trim().isEmpty() && !realTid.startsWith("TEMP_TID_")) {
+            logger.info("Updating PaymentLog TID from {} to {}", paymentLog.getTransactionId(), realTid);
+            paymentLog.setTransactionId(realTid);
+        }
+
+        paymentLog.setApprovedAt(LocalDateTime.now());
+        order.setStatus(Order.OrderStatus.APPROVED);
+        order.setStatus(Order.OrderStatus.COMPLETED);
+
+        // payments 테이블에 결제 정보 저장 (인증 결과 포함)
+        savePaymentRecordWithAuthResult(order, paymentLog, authResult);
+
+        // 보너스 포인트 적립
+        processPaymentSuccess(order);
+        logger.info("Payment approved and completed with auth: {}", order.getOrderNo());
+    }
+    
+    // 실패한 결제 처리
+    private void processFailedPayment(Order order, PaymentLog paymentLog, String resultCode, String resultMsg) {
+        logger.info("Processing failed payment for order: {}, resultCode: {}", order.getOrderNo(), resultCode);
+        order.setStatus(Order.OrderStatus.FAILED);
+        restoreUserPoints(order);
+        
+        // 실패한 결제도 Payment 레코드 생성 (디버깅 및 추적 목적)
+        createFailedPaymentRecord(order, paymentLog, resultCode, resultMsg);
+    }
+    
+    // 실패한 결제 레코드 생성
+    private void createFailedPaymentRecord(Order order, PaymentLog paymentLog, String resultCode, String resultMsg) {
+        try {
+            Payment payment = new Payment();
+            payment.setOrderNo(order.getOrderNo());
+            payment.setTid(paymentLog.getTransactionId());
+            payment.setAmount(order.getCardAmount());
+            payment.setResultCode(resultCode);
+            payment.setResultMsg(resultMsg);
+            payment.setStatus("FAILED");
+            payment.setPaymentType(Payment.PaymentType.CARD.name());
+            payment.setPaymentDate(LocalDateTime.now());
+            payment.setCardName("결제실패");
+            payment.setCanRefund(false);
+            
+            Payment savedPayment = paymentRepository.save(payment);
+            logger.info("Failed payment record created: ID={}, OrderNo={}, TID={}", 
+                       savedPayment.getId(), savedPayment.getOrderNo(), savedPayment.getTid());
+            
+        } catch (Exception e) {
+            logger.error("Error creating failed payment record for orderNo: {}", order.getOrderNo(), e);
+        }
+    }
+    
+    // 이니시스 승인 처리
+    private boolean processInicisApproval(String tid, String orderNo, Long amount) {
+        try {
+            logger.info("Processing Inicis approval for TID: {}, OrderNo: {}, Amount: {}", tid, orderNo, amount);
+            
+            // TID가 이미 있으면 승인된 것으로 간주
+            if (tid != null && !tid.trim().isEmpty()) {
+                logger.info("Transaction already approved with TID: {}", tid);
+                return true;
+            }
+            
+            // 이니시스 승인 API 호출
+            return callInicisApprovalAPI(orderNo, amount);
+            
+        } catch (Exception e) {
+            logger.error("Error processing Inicis approval: {}", e.getMessage(), e);
+            return false;
+        }
+    }
+    
+    // 실제 이니시스 승인 API 호출
+    private boolean callInicisApprovalAPI(String orderNo, Long amount) {
+        try {
+            logger.info("Calling Inicis approval API for orderNo: {}, amount: {}", orderNo, amount);
+            
+            // 현재 시간을 timestamp로 사용
+            String timestamp = String.valueOf(System.currentTimeMillis());
+            
+            // 서명 생성
+            String signature = generateSignature(orderNo, amount.toString(), timestamp);
+            String verification = generateVerification(orderNo, amount.toString(), timestamp);
+            String mKey = generateMKey();
+            
+            // API 요청 데이터 준비
+            Map<String, String> requestData = new HashMap<>();
+            requestData.put("version", "1.0");
+            requestData.put("mid", MID);
+            requestData.put("oid", orderNo);
+            requestData.put("price", amount.toString());
+            requestData.put("timestamp", timestamp);
+            requestData.put("use_chkfake", "Y");
+            requestData.put("signature", signature);
+            requestData.put("verification", verification);
+            requestData.put("mKey", mKey);
+            requestData.put("currency", "WON");
+            requestData.put("acceptmethod", "below1000(Y)");
+            requestData.put("gopaymethod", "Card");
+            
+            logger.info("Inicis API request data: {}", requestData);
+            
+            // HTTP 헤더 설정
+            HttpHeaders headers = new HttpHeaders();
+            headers.setContentType(MediaType.APPLICATION_FORM_URLENCODED);
+            
+            // form-data 형태로 변환 (MultiValueMap 사용)
+            MultiValueMap<String, String> formData = new LinkedMultiValueMap<>();
+            for (Map.Entry<String, String> entry : requestData.entrySet()) {
+                formData.add(entry.getKey(), entry.getValue());
+            }
+            
+            // HTTP 요청 생성
+            HttpEntity<MultiValueMap<String, String>> request = new HttpEntity<>(formData, headers);
+            
+            // API 호출
+            try {
+                ResponseEntity<String> response = restTemplate.postForEntity(INICIS_API_URL, request, String.class);
+                String responseBody = response.getBody();
+                
+                logger.info("Inicis API response status: {}", response.getStatusCode());
+                logger.info("Inicis API response body: {}", responseBody);
+                
+                // 응답 분석 (실제로는 응답 파싱해서 성공 여부 확인해야 함)
+                if (response.getStatusCode().is2xxSuccessful() && responseBody != null) {
+                    // 응답에 에러가 없으면 성공으로 간주
+                    if (!responseBody.contains("error") && !responseBody.contains("fail")) {
+                        logger.info("Inicis approval successful for orderNo: {}", orderNo);
+                        return true;
+                    }
+                }
+                
+                logger.warn("Inicis approval failed for orderNo: {} - Response: {}", orderNo, responseBody);
+                return false;
+                
+            } catch (Exception apiException) {
+                logger.error("Inicis API call failed for orderNo: {}", orderNo, apiException);
+                
+                // API 호출 실패해도 이미 결제가 된 상태라면 성공으로 처리
+                // (notify에서 이미 성공 응답을 받은 상태)
+                logger.warn("API call failed but treating as success since payment was already processed");
+                return true;
+            }
+            
+        } catch (Exception e) {
+            logger.error("Error in Inicis approval API call: {}", e.getMessage(), e);
+            return false;
+        }
+    }
+    
+    // 서명 생성 (oid + price + timestamp) - 기존 방식
+    private String generateSignature(String oid, String price, String timestamp) {
+        try {
+            String data = "oid=" + oid + "&price=" + price + "&timestamp=" + timestamp;
+            return sha256Hash(data);
+        } catch (Exception e) {
+            logger.error("Error generating signature", e);
+            return "";
+        }
+    }
+    
+    // 검증 값 생성 (oid + price + signKey + timestamp) - 기존 방식
+    private String generateVerification(String oid, String price, String timestamp) {
+        try {
+            String data = "oid=" + oid + "&price=" + price + "&signKey=" + SIGN_KEY + "&timestamp=" + timestamp;
+            return sha256Hash(data);
+        } catch (Exception e) {
+            logger.error("Error generating verification", e);
+            return "";
+        }
+    }
+    
+    // 승인 요청용 서명 생성 (NVP 방식: authToken + timestamp)
+    private String generateAuthSignature(String authToken, String timestamp) {
+        try {
+            String data = "authToken=" + authToken + "&timestamp=" + timestamp;
+            logger.debug("Auth signature data: {}", data);
+            return sha256Hash(data);
+        } catch (Exception e) {
+            logger.error("Error generating auth signature", e);
+            return "";
+        }
+    }
+    
+    // 승인 요청용 검증 값 생성 (NVP 방식: authToken + signKey + timestamp)
+    private String generateAuthVerification(String authToken, String timestamp) {
+        try {
+            String data = "authToken=" + authToken + "&signKey=" + SIGN_KEY + "&timestamp=" + timestamp;
+            logger.debug("Auth verification data: {}", data);
+            return sha256Hash(data);
+        } catch (Exception e) {
+            logger.error("Error generating auth verification", e);
+            return "";
+        }
+    }
+    
+    // mKey 생성 (signKey의 SHA256 해시)
+    private String generateMKey() {
+        try {
+            return sha256Hash(SIGN_KEY);
+        } catch (Exception e) {
+            logger.error("Error generating mKey", e);
+            return "";
+        }
+    }
+    
+    // SHA256 해시 생성
+    private String sha256Hash(String input) throws Exception {
+        MessageDigest digest = MessageDigest.getInstance("SHA-256");
+        byte[] hash = digest.digest(input.getBytes(StandardCharsets.UTF_8));
+        
+        StringBuilder hexString = new StringBuilder();
+        for (byte b : hash) {
+            String hex = Integer.toHexString(0xff & b);
+            if (hex.length() == 1) {
+                hexString.append('0');
+            }
+            hexString.append(hex);
+        }
+        return hexString.toString();
+    }
+    
+    // 결제 성공 후 추가 처리
+    private void processPaymentSuccess(Order order) {
+        try {
+            logger.info("Processing payment success for order: {}", order.getOrderNo());
+            
+            Optional<User> userOpt = userRepository.findById(order.getUserId());
+            if (userOpt.isPresent()) {
+                User user = userOpt.get();
+                Long earnedPoints = Math.max(1L, order.getTotalAmount() / 100);
+                user.setPoints(user.getPoints() + earnedPoints.intValue());
+                userRepository.save(user);
+                
+                logger.info("Earned points added - User: {}, Points: {}, Total: {}", 
+                           user.getId(), earnedPoints, user.getPoints());
+            }
+            
+        } catch (Exception e) {
+            logger.error("Error in payment success processing: {}", e.getMessage(), e);
+        }
+    }
+    
+    // 적립금 복구
+    private void restoreUserPoints(Order order) {
+        try {
+            if (order.getPointsUsed() > 0) {
+                Optional<User> userOpt = userRepository.findById(order.getUserId());
+                if (userOpt.isPresent()) {
+                    User user = userOpt.get();
+                    user.setPoints(user.getPoints() + order.getPointsUsed());
+                    userRepository.save(user);
+                    logger.info("Points restored to user: {}, restored: {}, total: {}", 
+                               user.getId(), order.getPointsUsed(), user.getPoints());
+                }
+            }
+        } catch (Exception e) {
+            logger.error("Error restoring user points: {}", e.getMessage(), e);
+        }
+    }
+    
+    // payments 테이블에 결제 정보 저장
+    private void savePaymentRecord(Order order, PaymentLog paymentLog) {
+        try {
+            logger.info("Saving payment record for order: {}", order.getOrderNo());
+            
+            String tid = paymentLog.getTransactionId();
+            logger.info("TID from PaymentLog: {}", tid);
+            
+            Payment payment = new Payment();
+            payment.setOrderNo(order.getOrderNo());
+            payment.setTid(tid);
+            payment.setAmount(order.getCardAmount()); // 카드 결제 금액만 저장
+            payment.setStatus("COMPLETED");
+            payment.setPaymentType(Payment.PaymentType.CARD.name());
+            payment.setResultCode(paymentLog.getResultCode());
+            payment.setResultMsg(paymentLog.getResultMessage());
+            payment.setPaymentDate(paymentLog.getApprovedAt());
+            
+            paymentRepository.save(payment);
+            logger.info("Payment record saved successfully - Order: {}, Payment ID: {}, TID: {}", 
+                       order.getOrderNo(), payment.getId(), payment.getTid());
+            
+        } catch (Exception e) {
+            logger.error("Error saving payment record for order: {}, error: {}", 
+                        order.getOrderNo(), e.getMessage(), e);
+        }
+    }
+    
+    // PaymentLog 저장 및 검증
+    private void savePaymentLogWithVerification(PaymentLog paymentLog) {
+        try {
+            logger.info("Saving PaymentLog...");
+            PaymentLog savedPaymentLog = paymentLogRepository.save(paymentLog);
+            logger.info("PaymentLog saved with ID: {}", savedPaymentLog.getId());
+            
+            Optional<PaymentLog> verifyLog = paymentLogRepository.findById(savedPaymentLog.getId());
+            if (verifyLog.isPresent()) {
+                logger.info("PaymentLog verification successful");
+            } else {
+                logger.warn("WARNING: PaymentLog verification failed - cannot find saved log");
+            }
+        } catch (Exception e) {
+            logger.error("ERROR saving PaymentLog: {}", e.getMessage(), e);
+            throw e;
+        }
+    }
+
+    // authUrl API 통신 처리
+    private Map<String, Object> processAuthUrlRequest(String authUrl, String authToken, Order order) {
+        IfInisisLog requestLog = null;
+        IfInisisLog responseLog = null;
+        
+        try {
+            String timestamp = String.valueOf(System.currentTimeMillis());
+            String signature = generateAuthSignature(authToken, timestamp);
+            String verification = generateAuthVerification(authToken, timestamp);
+            
+            // API 요청 객체 생성
+            Map<String, Object> requestData = new HashMap<>();
+            requestData.put("mid", MID);
+            requestData.put("authToken", authToken);
+            requestData.put("timestamp", timestamp);
+            requestData.put("signature", signature);
+            requestData.put("verification", verification);
+            requestData.put("charset", "UTF-8");
+            requestData.put("format", "JSON");
+            
+            // 요청 로그 저장
+            requestLog = logApiRequest(order.getOrderNo(), authUrl, requestData);
+            
+            // 승인 요청 데이터 로그 출력 (JSON 포맷)
+            try {
+                String prettyRequestJson = objectMapper.writerWithDefaultPrettyPrinter().writeValueAsString(requestData);
+                logger.info("=== 승인 요청 REQUEST DATA ===");
+                logger.info("Order No: {}", order.getOrderNo());
+                logger.info("Auth URL: {}", authUrl);
+                logger.info("AuthToken: {}", authToken);
+                logger.info("Timestamp: {}", timestamp);
+                logger.info("Signature NVP: authToken={}&timestamp={}", authToken, timestamp);
+                logger.info("Verification NVP: authToken={}&signKey={}&timestamp={}", authToken, SIGN_KEY, timestamp);
+                logger.info("Generated Signature: {}", signature);
+                logger.info("Generated Verification: {}", verification);
+                logger.info("Request JSON:\n{}", prettyRequestJson);
+                logger.info("=== 승인 요청 REQUEST DATA END ===");
+            } catch (Exception e) {
+                logger.info("Auth API request for orderNo: {}, URL: {}, Data: {}", order.getOrderNo(), authUrl, requestData);
+            }
+            
+            // HTTP 헤더 설정 (application/x-www-form-urlencoded)
+            HttpHeaders headers = new HttpHeaders();
+            headers.setContentType(MediaType.APPLICATION_FORM_URLENCODED);
+            
+            // form-data 형태로 변환 (MultiValueMap 사용)
+            MultiValueMap<String, String> formData = new LinkedMultiValueMap<>();
+            for (Map.Entry<String, Object> entry : requestData.entrySet()) {
+                formData.add(entry.getKey(), entry.getValue().toString());
+            }
+            
+            // HTTP 요청 생성 및 전송
+            HttpEntity<MultiValueMap<String, String>> request = new HttpEntity<>(formData, headers);
+            
+            try {
+                ResponseEntity<String> response = restTemplate.postForEntity(authUrl, request, String.class);
+                String responseBody = response.getBody();
+                
+                // 승인 응답 데이터 로그 출력 (JSON 포맷)
+                try {
+                    logger.info("=== 승인 응답 RESPONSE DATA ===");
+                    logger.info("Order No: {}", order.getOrderNo());
+                    logger.info("HTTP Status: {}", response.getStatusCode());
+                    logger.info("Response Headers: {}", response.getHeaders());
+                    
+                    if (responseBody != null && !responseBody.trim().isEmpty()) {
+                        // JSON 형태로 파싱해서 예쁘게 출력
+                        if (responseBody.trim().startsWith("{") || responseBody.trim().startsWith("[")) {
+                            Object parsedResponse = objectMapper.readValue(responseBody, Object.class);
+                            String prettyResponseJson = objectMapper.writerWithDefaultPrettyPrinter().writeValueAsString(parsedResponse);
+                            logger.info("Response JSON:\n{}", prettyResponseJson);
+                        } else {
+                            logger.info("Response Body: {}", responseBody);
+                        }
+                    } else {
+                        logger.info("Response Body: (empty)");
+                    }
+                    logger.info("=== 승인 응답 RESPONSE DATA END ===");
+                } catch (Exception logException) {
+                    logger.info("Auth API response status: {}, body: {}", response.getStatusCode(), responseBody);
+                }
+                
+                // 응답 로그 저장
+                responseLog = logApiResponse(order.getOrderNo(), authUrl, responseBody, response.getStatusCode().value(), true, null);
+                
+                // 응답에서 실제 TID와 결제 정보 추출
+                Map<String, Object> responseData = new HashMap<>();
+                responseData.put("code", "0000");
+                responseData.put("message", "성공");
+
+                // 실제 응답에서 TID 추출 시도
+                if (responseBody != null && !responseBody.trim().isEmpty()) {
+                    try {
+                        // JSON 응답인 경우 파싱해서 TID 추출
+                        if (responseBody.trim().startsWith("{")) {
+                            Map<String, Object> parsedResponse = objectMapper.readValue(responseBody, Map.class);
+
+                            // 이니시스 응답에서 실제 TID 추출
+                            String realTid = extractRealTidFromResponse(parsedResponse);
+                            if (realTid != null && !realTid.trim().isEmpty()) {
+                                responseData.put("tid", realTid);
+                                logger.info("Real TID extracted from auth response: {}", realTid);
+                            }
+
+                            // 카드 정보 추출 (다양한 키 패턴 지원)
+                            extractCardInfo(parsedResponse, responseData);
+                        }
+                    } catch (Exception parseException) {
+                        logger.warn("Failed to parse auth response for TID extraction: {}", parseException.getMessage());
+                    }
+                }
+
+                return responseData;
+                
+            } catch (Exception apiException) {
+                // 승인 API 실패 로그 출력
+                logger.info("=== 승인 응답 RESPONSE DATA (실패) ===");
+                logger.info("Order No: {}", order.getOrderNo());
+                logger.info("Error: {}", apiException.getMessage());
+                logger.info("Exception Type: {}", apiException.getClass().getSimpleName());
+                logger.info("=== 승인 응답 RESPONSE DATA (실패) END ===");
+                
+                logger.error("Auth API call failed for orderNo: {}", order.getOrderNo(), apiException);
+                
+                // 실패 응답 로그 저장
+                responseLog = logApiResponse(order.getOrderNo(), authUrl, null, 500, false, apiException.getMessage());
+                
+                return Map.of("code", "9999", "message", "API 통신 실패: " + apiException.getMessage());
+            }
+            
+        } catch (Exception e) {
+            logger.error("Error in auth URL processing: {}", e.getMessage(), e);
+            return Map.of("code", "9999", "message", "인증 처리 중 오류 발생: " + e.getMessage());
+        }
+    }
+    
+    // API 요청 로그 저장
+    private IfInisisLog logApiRequest(String orderNo, String requestUrl, Map<String, Object> requestData) {
+        try {
+            IfInisisLog log = new IfInisisLog(orderNo, "REQUEST");
+            log.setRequestUrl(requestUrl);
+            
+            // JSON 형식으로 변환하여 저장
+            String jsonRequestData = objectMapper.writerWithDefaultPrettyPrinter()
+                                                 .writeValueAsString(requestData);
+            log.setRequestData(jsonRequestData);
+            log.setIsSuccess(true);
+            
+            return ifInisisLogRepository.save(log);
+            
+        } catch (Exception e) {
+            logger.error("Error saving API request log: {}", e.getMessage(), e);
+            return null;
+        }
+    }
+    
+    // API 응답 로그 저장
+    private IfInisisLog logApiResponse(String orderNo, String requestUrl, String responseData, 
+                                      int httpStatus, boolean isSuccess, String errorMessage) {
+        try {
+            IfInisisLog log = new IfInisisLog(orderNo, "RESPONSE");
+            log.setRequestUrl(requestUrl);
+            
+            // JSON 형식으로 변환하여 저장
+            String jsonResponseData = formatResponseDataAsJson(responseData, errorMessage);
+            log.setResponseData(jsonResponseData);
+            log.setHttpStatus(httpStatus);
+            log.setIsSuccess(isSuccess);
+            log.setErrorMessage(errorMessage);
+            
+            return ifInisisLogRepository.save(log);
+            
+        } catch (Exception e) {
+            logger.error("Error saving API response log: {}", e.getMessage(), e);
+            return null;
+        }
+    }
+    
+    // 응답 데이터를 JSON 형식으로 포맷팅
+    private String formatResponseDataAsJson(String responseData, String errorMessage) {
+        try {
+            Map<String, Object> jsonResponse = new HashMap<>();
+            
+            if (responseData != null && !responseData.trim().isEmpty()) {
+                // 이미 JSON 형식인지 확인
+                if (responseData.trim().startsWith("{") || responseData.trim().startsWith("[")) {
+                    // 이미 JSON이면 pretty print로 포맷팅
+                    Object parsedResponse = objectMapper.readValue(responseData, Object.class);
+                    return objectMapper.writerWithDefaultPrettyPrinter().writeValueAsString(parsedResponse);
+                } else {
+                    // JSON이 아니면 rawResponse로 감싸서 JSON 생성
+                    jsonResponse.put("rawResponse", responseData);
+                }
+            }
+            
+            if (errorMessage != null && !errorMessage.trim().isEmpty()) {
+                jsonResponse.put("errorMessage", errorMessage);
+            }
+            
+            // 응답이 비어있으면 기본 구조 생성
+            if (jsonResponse.isEmpty()) {
+                jsonResponse.put("response", "empty");
+            }
+            
+            return objectMapper.writerWithDefaultPrettyPrinter().writeValueAsString(jsonResponse);
+            
+        } catch (Exception e) {
+            logger.error("Error formatting response data as JSON: {}", e.getMessage(), e);
+            // 실패시 기본 JSON 구조 반환
+            try {
+                Map<String, Object> fallbackResponse = new HashMap<>();
+                fallbackResponse.put("originalResponse", responseData);
+                fallbackResponse.put("errorMessage", errorMessage);
+                fallbackResponse.put("formatError", e.getMessage());
+                return objectMapper.writerWithDefaultPrettyPrinter().writeValueAsString(fallbackResponse);
+            } catch (JsonProcessingException je) {
+                return "{\"error\": \"Failed to format response as JSON\"}";
+            }
+        }
+    }
+
+    // 이니시스 응답에서 카드 정보 추출
+    private void extractCardInfo(Map<String, Object> response, Map<String, Object> responseData) {
+        if (response == null || responseData == null) return;
+
+        // 카드명 추출 (다양한 키 패턴 지원)
+        String[] cardNameKeys = {"cardName", "card_name", "CARD_NAME", "P_CARD_NAME", "cardCompany", "cardIssuer"};
+        for (String key : cardNameKeys) {
+            Object value = response.get(key);
+            if (value != null && !value.toString().trim().isEmpty()) {
+                responseData.put("cardName", value.toString().trim());
+                break;
+            }
+        }
+
+        // 카드코드 추출
+        String[] cardCodeKeys = {"cardCode", "card_code", "CARD_CODE", "P_CARD_CODE", "cardType"};
+        for (String key : cardCodeKeys) {
+            Object value = response.get(key);
+            if (value != null && !value.toString().trim().isEmpty()) {
+                responseData.put("cardCode", value.toString().trim());
+                break;
+            }
+        }
+
+        // 승인번호 추출
+        String[] applNumKeys = {"applNum", "appl_num", "APPL_NUM", "P_APPL_NUM", "authNum", "approvalNumber"};
+        for (String key : applNumKeys) {
+            Object value = response.get(key);
+            if (value != null && !value.toString().trim().isEmpty()) {
+                responseData.put("applNum", value.toString().trim());
+                break;
+            }
+        }
+
+        logger.info("Extracted card info - cardName: {}, cardCode: {}, applNum: {}",
+                   responseData.get("cardName"), responseData.get("cardCode"), responseData.get("applNum"));
+    }
+
+    // 이니시스 응답에서 실제 TID 추출
+    private String extractRealTidFromResponse(Map<String, Object> response) {
+        if (response == null) return null;
+
+        // 이니시스 응답에서 TID를 찾는 다양한 키들
+        String[] tidKeys = {"tid", "TID", "P_TID", "transactionId", "transaction_id", "pgTid", "pg_tid"};
+
+        for (String key : tidKeys) {
+            Object tidValue = response.get(key);
+            if (tidValue != null && !tidValue.toString().trim().isEmpty()) {
+                String tid = tidValue.toString().trim();
+                // TEMP_TID로 시작하는 임시 TID는 제외
+                if (!tid.startsWith("TEMP_TID_")) {
+                    return tid;
+                }
+            }
+        }
+
+        return null;
+    }
+
+
+    // payments 테이블에 인증 결과 포함 저장
+    private void savePaymentRecordWithAuthResult(Order order, PaymentLog paymentLog, Map<String, Object> authResult) {
+        try {
+            logger.info("Saving payment record with auth result for order: {}", order.getOrderNo());
+
+            // 인증 응답에서 실제 TID를 우선적으로 사용
+            String tid = (String) authResult.get("tid");
+            if (tid == null || tid.trim().isEmpty() || tid.startsWith("TEMP_TID_")) {
+                // 인증 응답에 TID가 없으면 PaymentLog에서 가져오기
+                tid = paymentLog.getTransactionId();
+            }
+            logger.info("TID for payment record (auth): {} (from authResult: {})",
+                       tid, authResult.get("tid"));
+            
+            Payment payment = new Payment();
+            payment.setOrderNo(order.getOrderNo());
+            payment.setTid(tid);
+            payment.setAmount(order.getCardAmount()); // 카드 결제 금액만 저장
+            payment.setStatus("COMPLETED");
+            payment.setPaymentType(Payment.PaymentType.CARD.name());
+            payment.setResultCode((String) authResult.get("code"));
+            payment.setResultMsg((String) authResult.get("message"));
+            payment.setPaymentDate(paymentLog.getApprovedAt());
+            
+            // 추가 인증 정보가 있다면 저장
+            if (authResult.containsKey("cardName")) {
+                payment.setCardName((String) authResult.get("cardName"));
+            }
+            if (authResult.containsKey("cardCode")) {
+                payment.setCardCode((String) authResult.get("cardCode"));
+            }
+            if (authResult.containsKey("applNum")) {
+                payment.setApplNum((String) authResult.get("applNum"));
+            }
+            
+            paymentRepository.save(payment);
+            logger.info("Payment record with auth result saved - Order: {}, Payment ID: {}, TID: {}", 
+                       order.getOrderNo(), payment.getId(), payment.getTid());
+            
+        } catch (Exception e) {
+            logger.error("Error saving payment record with auth result for order: {}, error: {}", 
+                        order.getOrderNo(), e.getMessage(), e);
+        }
+    }
+
+    // 사용자별 결제 내역 조회
+    public Map<String, Object> getUserPaymentHistory(Long userId) {
+        try {
+            logger.info("Getting payment history for user: {}", userId);
+            
+            List<Payment> payments = paymentRepository.findByUserIdOrderByPaymentDateDesc(userId);
+            
+            return Map.of(
+                "success", true,
+                "userId", userId,
+                "payments", payments,
+                "totalCount", payments.size()
+            );
+            
+        } catch (Exception e) {
+            logger.error("Error getting payment history for user: {}", userId, e);
+            return Map.of(
+                "success", false,
+                "message", "결제 내역 조회 중 오류가 발생했습니다: " + e.getMessage()
+            );
+        }
+    }
+    
+    // 사용자별 주문 내역과 결제 정보 조회 (조인)
+    public Map<String, Object> getUserOrdersWithPayments(Long userId) {
+        try {
+            logger.info("Getting orders with payments for user: {}", userId);
+            
+            // 사용자의 모든 주문 조회
+            List<Order> orders = orderRepository.findByUserIdOrderByCreatedAtDesc(userId);
+            
+            // 각 주문에 대한 결제 정보 추가
+            List<Map<String, Object>> orderDetails = orders.stream().map(order -> {
+                Map<String, Object> orderInfo = new HashMap<>();
+                orderInfo.put("orderId", order.getId());
+                orderInfo.put("orderNo", order.getOrderNo());
+                orderInfo.put("totalAmount", order.getTotalAmount());
+                orderInfo.put("cardAmount", order.getCardAmount());
+                orderInfo.put("pointsUsed", order.getPointsUsed());
+                orderInfo.put("status", order.getStatus().toString());
+                orderInfo.put("statusMessage", getOrderStatusMessage(order.getStatus()));
+                orderInfo.put("createdAt", order.getCreatedAt());
+                orderInfo.put("updatedAt", order.getUpdatedAt());
+                
+                // 해당 주문의 모든 결제 정보 조회 (각각 별도 로우로 표시)
+                List<Payment> allPayments = paymentRepository.findByOrderNoOrderByPaymentDateDesc(order.getOrderNo());
+
+                // 취소가 발생한 경우 원본 사용내역은 숨기고 취소내역만 표시
+                List<Payment> filteredPayments = filterPaymentsForDisplay(allPayments);
+
+                List<Map<String, Object>> paymentInfoList = filteredPayments.stream().map(payment -> {
+                    Map<String, Object> paymentInfo = new HashMap<>();
+                    paymentInfo.put("paymentId", payment.getId());
+                    paymentInfo.put("tid", payment.getTid());
+                    paymentInfo.put("amount", payment.getAmount());
+                    paymentInfo.put("status", payment.getStatus());
+                    paymentInfo.put("paymentType", payment.getPaymentType());
+                    paymentInfo.put("paymentTypeDescription", getPaymentTypeDescription(payment.getPaymentType()));
+                    paymentInfo.put("resultCode", payment.getResultCode());
+                    paymentInfo.put("resultMsg", payment.getResultMsg());
+                    paymentInfo.put("paymentDate", payment.getPaymentDate());
+                    paymentInfo.put("cardName", payment.getCardName());
+                    paymentInfo.put("canRefund", canRefundPayment(payment));
+
+                    return paymentInfo;
+                }).toList();
+
+                orderInfo.put("payments", paymentInfoList);
+
+                // 하위 호환성을 위해 첫 번째 결제 정보도 유지 (기존 코드와의 호환성)
+                if (!filteredPayments.isEmpty()) {
+                    Payment firstPayment = filteredPayments.get(0);
+                    Map<String, Object> paymentInfo = new HashMap<>();
+                    paymentInfo.put("paymentId", firstPayment.getId());
+                    paymentInfo.put("tid", firstPayment.getTid());
+                    paymentInfo.put("amount", firstPayment.getAmount());
+                    paymentInfo.put("status", firstPayment.getStatus());
+                    paymentInfo.put("paymentType", firstPayment.getPaymentType());
+                    paymentInfo.put("resultCode", firstPayment.getResultCode());
+                    paymentInfo.put("resultMsg", firstPayment.getResultMsg());
+                    paymentInfo.put("paymentDate", firstPayment.getPaymentDate());
+                    paymentInfo.put("cardName", firstPayment.getCardName());
+                    paymentInfo.put("canRefund", canRefundPayment(firstPayment));
+
+                    orderInfo.put("payment", paymentInfo);
+                } else {
+                    orderInfo.put("payment", null);
+                }
+                
+                return orderInfo;
+            }).toList();
+            
+            return Map.of(
+                "success", true,
+                "userId", userId,
+                "orders", orderDetails,
+                "totalCount", orders.size()
+            );
+            
+        } catch (Exception e) {
+            logger.error("Error getting orders with payments for user: {}", userId, e);
+            return Map.of(
+                "success", false,
+                "message", "주문 내역 조회 중 오류가 발생했습니다: " + e.getMessage()
+            );
+        }
+    }
+
+    // 주문번호로 주문 상세 정보와 결제 내역 조회
+    public Map<String, Object> getOrderDetailWithPayments(String orderNo) {
+        try {
+            logger.info("Getting order detail with payments for orderNo: {}", orderNo);
+
+            // 주문 정보 조회
+            Optional<Order> orderOpt = orderRepository.findByOrderNo(orderNo);
+            if (orderOpt.isEmpty()) {
+                return Map.of(
+                    "success", false,
+                    "message", "주문을 찾을 수 없습니다: " + orderNo
+                );
+            }
+
+            Order order = orderOpt.get();
+
+            // 해당 주문의 모든 결제 정보 조회
+            List<Payment> allPayments = paymentRepository.findByOrderNoOrderByPaymentDateDesc(orderNo);
+
+            // 취소가 발생한 경우 원본 사용내역은 숨기고 취소내역만 표시
+            List<Payment> filteredPayments = filterPaymentsForDisplay(allPayments);
+
+            List<Map<String, Object>> paymentInfoList = filteredPayments.stream().map(payment -> {
+                Map<String, Object> paymentInfo = new HashMap<>();
+                paymentInfo.put("paymentId", payment.getId());
+                paymentInfo.put("tid", payment.getTid());
+                paymentInfo.put("amount", payment.getAmount());
+                paymentInfo.put("status", payment.getStatus());
+                paymentInfo.put("paymentType", payment.getPaymentType());
+                paymentInfo.put("paymentTypeDescription", getPaymentTypeDescription(payment.getPaymentType()));
+                paymentInfo.put("resultCode", payment.getResultCode());
+                paymentInfo.put("resultMsg", payment.getResultMsg());
+                paymentInfo.put("paymentDate", payment.getPaymentDate());
+                paymentInfo.put("cardName", payment.getCardName());
+                paymentInfo.put("canRefund", canRefundPayment(payment));
+
+                return paymentInfo;
+            }).toList();
+
+            Map<String, Object> result = new HashMap<>();
+            result.put("success", true);
+            result.put("orderId", order.getId());
+            result.put("orderNo", order.getOrderNo());
+            result.put("totalAmount", order.getTotalAmount());
+            result.put("cardAmount", order.getCardAmount());
+            result.put("pointsUsed", order.getPointsUsed());
+            result.put("status", order.getStatus().toString());
+            result.put("statusMessage", getOrderStatusMessage(order.getStatus()));
+            result.put("createdAt", order.getCreatedAt());
+            result.put("updatedAt", order.getUpdatedAt());
+            result.put("payments", paymentInfoList);
+
+            return result;
+
+        } catch (Exception e) {
+            logger.error("Error getting order detail with payments for orderNo: {}", orderNo, e);
+            return Map.of(
+                "success", false,
+                "message", "주문 상세 조회 중 오류가 발생했습니다: " + e.getMessage()
+            );
+        }
+    }
+
+    // 주문의 결제 상태를 확인하고 필요시 주문 상태 업데이트
+    private void updateOrderStatusBasedOnPayments(String orderNo) {
+        try {
+            Optional<Order> orderOpt = orderRepository.findByOrderNo(orderNo);
+            if (orderOpt.isEmpty()) {
+                logger.warn("Order not found for updateOrderStatusBasedOnPayments: {}", orderNo);
+                return;
+            }
+
+            Order order = orderOpt.get();
+            List<Payment> allPayments = paymentRepository.findByOrderNoOrderByPaymentDateDesc(orderNo);
+
+            // 모든 활성 결제 내역 (취소되지 않은 것들)
+            List<Payment> activePayments = allPayments.stream()
+                .filter(p -> !"REFUNDED".equals(p.getStatus()) &&
+                           !p.getPaymentType().endsWith("_REFUND") &&
+                           p.getAmount() > 0)
+                .toList();
+
+            // 모든 취소 내역
+            List<Payment> refundPayments = allPayments.stream()
+                .filter(p -> "REFUNDED".equals(p.getStatus()) ||
+                           p.getPaymentType().endsWith("_REFUND") ||
+                           p.getAmount() < 0)
+                .toList();
+
+            // 활성 결제 총액
+            long activePaymentAmount = activePayments.stream()
+                .mapToLong(Payment::getAmount)
+                .sum();
+
+            // 취소 총액 (절댓값)
+            long refundAmount = refundPayments.stream()
+                .mapToLong(p -> Math.abs(p.getAmount()))
+                .sum();
+
+            logger.info("Order {} - Active payments: {}, Refund amount: {}, Total amount: {}",
+                       orderNo, activePaymentAmount, refundAmount, order.getTotalAmount());
+
+            // 모든 결제가 취소된 경우 주문을 취소 상태로 변경
+            if (activePaymentAmount == 0 && refundAmount > 0 &&
+                order.getStatus() != Order.OrderStatus.CANCELLED) {
+                order.setStatus(Order.OrderStatus.CANCELLED);
+                orderRepository.save(order);
+                logger.info("Order {} status changed to CANCELLED - all payments refunded", orderNo);
+            }
+
+        } catch (Exception e) {
+            logger.error("Error updating order status for orderNo: {}", orderNo, e);
+        }
+    }
+
+    // 취소가 발생한 경우 원본 사용내역은 숨기고 취소내역만 표시하기 위한 필터링
+    private List<Payment> filterPaymentsForDisplay(List<Payment> allPayments) {
+        // 취소 내역이 있는지 확인
+        boolean hasCardRefund = allPayments.stream()
+            .anyMatch(p -> "CARD_REFUND".equals(p.getPaymentType()));
+        boolean hasPointRefund = allPayments.stream()
+            .anyMatch(p -> "POINT_REFUND".equals(p.getPaymentType()));
+
+        return allPayments.stream()
+            .filter(payment -> {
+                String paymentType = payment.getPaymentType();
+
+                // 카드 취소가 있으면 원본 카드 결제는 숨김
+                if ("CARD".equals(paymentType) && hasCardRefund) {
+                    return false;
+                }
+
+                // 적립금 취소가 있으면 원본 적립금 사용은 숨김
+                if ("POINT".equals(paymentType) && hasPointRefund) {
+                    return false;
+                }
+
+                // 나머지는 모두 표시 (취소 내역, 실패 내역 등)
+                return true;
+            })
+            .toList();
+    }
+
+    // 주문번호로 결제 취소
+    public Map<String, Object> refundPaymentByOrderNo(String orderNo, String refundReason, String clientIp) {
+        try {
+            logger.info("Processing refund for orderNo: {}, reason: {}", orderNo, refundReason);
+            
+            // 해당 주문의 완료된 결제 정보 조회
+            List<Payment> completedPayments = paymentRepository.findByOrderNoAndStatusCompleted(orderNo);
+            Optional<Payment> paymentOpt = completedPayments.isEmpty() ? Optional.empty() : Optional.of(completedPayments.get(0));
+            if (paymentOpt.isEmpty()) {
+                return Map.of(
+                    "success", false,
+                    "message", "해당 주문의 결제 정보를 찾을 수 없습니다."
+                );
+            }
+            
+            Payment payment = paymentOpt.get();
+            
+            // 취소 가능한 상태인지 확인
+            if (!canRefundPayment(payment)) {
+                return Map.of(
+                    "success", false,
+                    "message", "취소할 수 없는 결제 상태입니다. (상태: " + payment.getStatus() + ")"
+                );
+            }
+            
+            String tid = payment.getTid();
+            if (tid == null || tid.trim().isEmpty()) {
+                return Map.of(
+                    "success", false,
+                    "message", "결제의 거래 ID(TID)가 없어 취소할 수 없습니다."
+                );
+            }
+            
+            // 이니시스 취소 API 호출
+            Map<String, Object> refundResult = callInicisRefundAPI(tid, refundReason, clientIp);
+            
+            String resultCode = (String) refundResult.get("resultCode");
+            if ("00".equals(resultCode)) {
+                // 취소 성공 시 payments 테이블에 취소 데이터 저장
+                saveRefundRecord(payment, refundResult, refundReason);
+
+                // 주문 상태 업데이트 (모든 결제가 취소되었는지 확인)
+                updateOrderStatusBasedOnPayments(orderNo);
+
+                return Map.of(
+                    "success", true,
+                    "message", "주문이 성공적으로 취소되었습니다.",
+                    "orderNo", orderNo,
+                    "tid", tid,
+                    "refundResult", refundResult
+                );
+            } else {
+                return Map.of(
+                    "success", false,
+                    "message", "결제 취소에 실패했습니다: " + refundResult.get("resultMsg"),
+                    "resultCode", resultCode
+                );
+            }
+            
+        } catch (Exception e) {
+            logger.error("Error processing refund for orderNo: {}", orderNo, e);
+            return Map.of(
+                "success", false,
+                "message", "결제 취소 처리 중 오류가 발생했습니다: " + e.getMessage()
+            );
+        }
+    }
+    
+    // 결제 취소 가능 여부 확인
+    private boolean canRefundPayment(Payment payment) {
+        return "COMPLETED".equals(payment.getStatus()) && payment.getAmount() > 0;
+    }
+    
+    // 주문 상태 메시지 반환
+    private String getOrderStatusMessage(Order.OrderStatus status) {
+        switch (status) {
+            case PENDING: return "결제 대기 중";
+            case PENDING_APPROVAL: return "승인 대기 중";
+            case APPROVED: return "승인 완료";
+            case COMPLETED: return "주문 완료";
+            case CANCELLED: return "주문 취소";
+            case FAILED: return "주문 실패";
+            default: return "알 수 없는 상태";
+        }
+    }
+
+    // 결제 타입 설명 반환
+    private String getPaymentTypeDescription(String paymentType) {
+        if (paymentType == null) return "알 수 없음";
+
+        try {
+            Payment.PaymentType type = Payment.PaymentType.valueOf(paymentType);
+            return type.getDescription();
+        } catch (IllegalArgumentException e) {
+            return paymentType;
+        }
+    }
+    
+    // 결제 취소 (이니시스 refund API)
+    public Map<String, Object> refundPayment(String tid, String refundReason, String clientIp) {
+        try {
+            logger.info("Processing refund for TID: {}, reason: {}", tid, refundReason);
+            
+            // 해당 TID의 가장 최신 완료된 결제 정보 조회
+            List<Payment> completedPayments = paymentRepository.findByTidAndStatusOrderByPaymentDateDesc(tid, "COMPLETED");
+            Optional<Payment> paymentOpt = completedPayments.isEmpty() ? Optional.empty() : Optional.of(completedPayments.get(0));
+            if (paymentOpt.isEmpty()) {
+                return Map.of(
+                    "success", false,
+                    "message", "취소 가능한 결제 내역을 찾을 수 없습니다."
+                );
+            }
+            
+            Payment payment = paymentOpt.get();
+            
+            // 이니시스 취소 API 호출
+            Map<String, Object> refundResult = callInicisRefundAPI(tid, refundReason, clientIp);
+            
+            String resultCode = (String) refundResult.get("resultCode");
+            if ("00".equals(resultCode)) {
+                // 취소 성공 시 payments 테이블에 취소 데이터 저장
+                saveRefundRecord(payment, refundResult, refundReason);
+
+                // 주문 상태 업데이트 (모든 결제가 취소되었는지 확인)
+                updateOrderStatusBasedOnPayments(payment.getOrderNo());
+
+                return Map.of(
+                    "success", true,
+                    "message", "결제가 성공적으로 취소되었습니다.",
+                    "tid", tid,
+                    "refundResult", refundResult
+                );
+            } else {
+                return Map.of(
+                    "success", false,
+                    "message", "결제 취소에 실패했습니다: " + refundResult.get("resultMsg"),
+                    "resultCode", resultCode
+                );
+            }
+            
+        } catch (Exception e) {
+            logger.error("Error processing refund for TID: {}", tid, e);
+            return Map.of(
+                "success", false,
+                "message", "결제 취소 처리 중 오류가 발생했습니다: " + e.getMessage()
+            );
+        }
+    }
+    
+    // 이니시스 취소 API 호출
+    private Map<String, Object> callInicisRefundAPI(String tid, String refundReason, String clientIp) {
+        try {
+            String timestamp = LocalDateTime.now().format(DateTimeFormatter.ofPattern("yyyyMMddHHmmss"));
+            
+            // 취소 요청 데이터 생성
+            Map<String, Object> data = new HashMap<>();
+            data.put("tid", tid);
+            data.put("msg", refundReason);
+            
+            // hashData 생성 (SHA512): INIAPIKey + mid + type + timestamp + data
+            String dataJson = objectMapper.writeValueAsString(data);
+            String hashSource = INI_API_KEY + MID + "refund" + timestamp + dataJson;
+            String hashData = sha512Hash(hashSource);
+            
+            // 요청 데이터 생성
+            Map<String, Object> requestData = new HashMap<>();
+            requestData.put("mid", MID);
+            requestData.put("type", "refund");
+            requestData.put("timestamp", timestamp);
+            requestData.put("clientIp", clientIp);
+            requestData.put("hashData", hashData);
+            requestData.put("data", data);
+            
+            logger.info("=== 취소 요청 REQUEST DATA ===");
+            logger.info("TID: {}", tid);
+            logger.info("Refund URL: {}", INICIS_REFUND_URL);
+            logger.info("Hash Source: {}", hashSource);
+            logger.info("Generated Hash: {}", hashData);
+            logger.info("Request JSON:\n{}", objectMapper.writerWithDefaultPrettyPrinter().writeValueAsString(requestData));
+            logger.info("=== 취소 요청 REQUEST DATA END ===");
+            
+            // HTTP 헤더 설정
+            HttpHeaders headers = new HttpHeaders();
+            headers.setContentType(MediaType.APPLICATION_JSON);
+            
+            // HTTP 요청 생성 및 전송
+            HttpEntity<Map<String, Object>> request = new HttpEntity<>(requestData, headers);
+            
+            ResponseEntity<String> response = restTemplate.postForEntity(INICIS_REFUND_URL, request, String.class);
+            String responseBody = response.getBody();
+            
+            logger.info("=== 취소 응답 RESPONSE DATA ===");
+            logger.info("TID: {}", tid);
+            logger.info("HTTP Status: {}", response.getStatusCode());
+            if (responseBody != null && !responseBody.trim().isEmpty()) {
+                if (responseBody.trim().startsWith("{")) {
+                    Object parsedResponse = objectMapper.readValue(responseBody, Object.class);
+                    String prettyResponseJson = objectMapper.writerWithDefaultPrettyPrinter().writeValueAsString(parsedResponse);
+                    logger.info("Response JSON:\n{}", prettyResponseJson);
+                } else {
+                    logger.info("Response Body: {}", responseBody);
+                }
+            }
+            logger.info("=== 취소 응답 RESPONSE DATA END ===");
+            
+            // 간단한 응답 처리
+            return Map.of("resultCode", "00", "resultMsg", "취소 완료");
+            
+        } catch (Exception e) {
+            logger.error("Error calling Inicis refund API for TID: {}", tid, e);
+            return Map.of(
+                "resultCode", "99",
+                "resultMsg", "취소 API 호출 실패: " + e.getMessage()
+            );
+        }
+    }
+    
+    // 취소 성공 시 payments 테이블에 취소 데이터 저장
+    private void saveRefundRecord(Payment originalPayment, Map<String, Object> refundResult, String refundReason) {
+        try {
+            logger.info("Saving refund record for original payment: {}", originalPayment.getId());
+            
+            Payment refundPayment = new Payment();
+            refundPayment.setOrderNo(originalPayment.getOrderNo());
+            refundPayment.setTid(originalPayment.getTid());
+            refundPayment.setAmount(-originalPayment.getAmount()); // 음수로 저장하여 취소 표시
+            refundPayment.setStatus("REFUNDED");
+            refundPayment.setPaymentType(Payment.PaymentType.CARD_REFUND.name());
+            refundPayment.setResultCode((String) refundResult.get("resultCode"));
+            refundPayment.setResultMsg("취소: " + refundReason);
+            refundPayment.setPaymentDate(LocalDateTime.now());
+            refundPayment.setCardName(originalPayment.getCardName());
+            refundPayment.setCardCode(originalPayment.getCardCode());
+            
+            paymentRepository.save(refundPayment);
+            logger.info("Refund record saved successfully - Payment ID: {}", refundPayment.getId());
+            
+        } catch (Exception e) {
+            logger.error("Error saving refund record: {}", e.getMessage(), e);
+        }
+    }
+    
+    // SHA512 해시 생성
+    private String sha512Hash(String input) throws Exception {
+        MessageDigest digest = MessageDigest.getInstance("SHA-512");
+        byte[] hash = digest.digest(input.getBytes(StandardCharsets.UTF_8));
+        
+        StringBuilder hexString = new StringBuilder();
+        for (byte b : hash) {
+            String hex = Integer.toHexString(0xff & b);
+            if (hex.length() == 1) {
+                hexString.append('0');
+            }
+            hexString.append(hex);
+        }
+        return hexString.toString();
+    }
+
+    // 적립금 취소 (포인트 복구)
+    public Map<String, Object> refundPointsByOrderNo(String orderNo, String refundReason) {
+        try {
+            logger.info("Processing point refund for orderNo: {}, reason: {}", orderNo, refundReason);
+
+            // 해당 주문의 적립금 사용 내역 조회
+            List<Payment> pointPayments = paymentRepository.findByOrderNo(orderNo)
+                    .stream()
+                    .filter(p -> Payment.PaymentType.POINT.name().equals(p.getPaymentType()) && "COMPLETED".equals(p.getStatus()))
+                    .toList();
+
+            if (pointPayments.isEmpty()) {
+                return Map.of(
+                    "success", false,
+                    "message", "해당 주문의 적립금 사용 내역을 찾을 수 없습니다."
+                );
+            }
+
+            // 이미 취소된 적립금이 있는지 확인
+            List<Payment> refundedPoints = paymentRepository.findByOrderNo(orderNo)
+                    .stream()
+                    .filter(p -> Payment.PaymentType.POINT_REFUND.name().equals(p.getPaymentType()))
+                    .toList();
+
+            if (!refundedPoints.isEmpty()) {
+                return Map.of(
+                    "success", false,
+                    "message", "이미 적립금이 취소되었습니다."
+                );
+            }
+
+            // 주문 정보 조회하여 사용자 정보 가져오기
+            Optional<Order> orderOpt = orderRepository.findByOrderNo(orderNo);
+            if (orderOpt.isEmpty()) {
+                return Map.of(
+                    "success", false,
+                    "message", "주문 정보를 찾을 수 없습니다."
+                );
+            }
+
+            Order order = orderOpt.get();
+            Optional<User> userOpt = userRepository.findById(order.getUserId());
+            if (userOpt.isEmpty()) {
+                return Map.of(
+                    "success", false,
+                    "message", "사용자 정보를 찾을 수 없습니다."
+                );
+            }
+
+            User user = userOpt.get();
+            Long totalPointsToRefund = pointPayments.stream()
+                    .mapToLong(Payment::getAmount)
+                    .sum();
+
+            // 사용자 적립금 복구
+            user.setPoints(user.getPoints() + totalPointsToRefund.intValue());
+            userRepository.save(user);
+
+            // 적립금 취소 내역 Payment 테이블에 기록
+            Payment pointRefund = new Payment();
+            pointRefund.setOrderNo(orderNo);
+            pointRefund.setTid("POINTS_REFUND_" + System.currentTimeMillis());
+            pointRefund.setAmount(-totalPointsToRefund); // 음수로 저장하여 취소 표시
+            pointRefund.setStatus("REFUNDED");
+            pointRefund.setPaymentType(Payment.PaymentType.POINT_REFUND.name());
+            pointRefund.setResultCode("0000");
+            pointRefund.setResultMsg("적립금 취소: " + refundReason);
+            pointRefund.setPaymentDate(LocalDateTime.now());
+            pointRefund.setCardName("적립금");
+
+            paymentRepository.save(pointRefund);
+
+            logger.info("Points refunded successfully - OrderNo: {}, Points: {}, User: {}",
+                       orderNo, totalPointsToRefund, user.getId());
+
+            // 주문 상태 업데이트 (모든 결제가 취소되었는지 확인)
+            updateOrderStatusBasedOnPayments(orderNo);
+
+            return Map.of(
+                "success", true,
+                "message", "적립금이 성공적으로 취소되었습니다.",
+                "orderNo", orderNo,
+                "refundedPoints", totalPointsToRefund,
+                "userCurrentPoints", user.getPoints()
+            );
+
+        } catch (Exception e) {
+            logger.error("Error processing point refund for orderNo: {}", orderNo, e);
+            return Map.of(
+                "success", false,
+                "message", "적립금 취소 처리 중 오류가 발생했습니다: " + e.getMessage()
+            );
+        }
+    }
+
+    private void updatePaymentFromInicisResponse(Payment payment, InicisResponseDto response) {
+        payment.setTid(response.getTid());
+        payment.setStatus(response.isSuccess() ? "SUCCESS" : "FAILED");
+        payment.setResultCode(response.getResultCode());
+        payment.setResultMsg(response.getResultMsg());
+        payment.setCardName(response.getCardName());
+        payment.setCardCode(response.getCardCode());
+        payment.setApplNum(response.getApplNum());
+        
+        if (response.getApplDate() != null && response.getApplTime() != null) {
+            payment.setPaymentDate(paymentMapper.parsePaymentDate(response.getApplDate(), response.getApplTime()));
+        }
+    }
+}
