@@ -13,6 +13,9 @@ public class PaymentResultDto {
     private String cardName;
     private String applNum;
     private String redirectUrl;
+    private boolean success;
+    private String resultCode;
+    private String resultMessage;
     
     public PaymentResultDto() {}
     
@@ -56,4 +59,13 @@ public class PaymentResultDto {
     
     public String getRedirectUrl() { return redirectUrl; }
     public void setRedirectUrl(String redirectUrl) { this.redirectUrl = redirectUrl; }
+
+    public boolean isSuccess() { return success; }
+    public void setSuccess(boolean success) { this.success = success; }
+
+    public String getResultCode() { return resultCode; }
+    public void setResultCode(String resultCode) { this.resultCode = resultCode; }
+
+    public String getResultMessage() { return resultMessage; }
+    public void setResultMessage(String resultMessage) { this.resultMessage = resultMessage; }
 }

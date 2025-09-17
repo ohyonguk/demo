@@ -14,18 +14,19 @@ public class IfInisisLog {
     @Column(name = "order_no", nullable = false, length = 50)
     private String orderNo;
     
-    @Column(name = "request_type", nullable = false, length = 20)
+    @Column(name = "request_type", nullable = false, length = 50)
     private String requestType;
+
+    @Column(name = "payment_provider", nullable = false, length = 20)
+    private String paymentProvider = "INICIS"; // INICIS, NICEPAY (기본값)
     
     @Column(name = "request_url", length = 500)
     private String requestUrl;
     
-    @Lob
-    @Column(name = "request_data")
+    @Column(name = "request_data", columnDefinition = "TEXT")
     private String requestData;
-    
-    @Lob
-    @Column(name = "response_data")
+
+    @Column(name = "response_data", columnDefinition = "TEXT")
     private String responseData;
     
     @Column(name = "http_status")
@@ -34,8 +35,7 @@ public class IfInisisLog {
     @Column(name = "is_success")
     private Boolean isSuccess = false;
     
-    @Lob
-    @Column(name = "error_message")
+    @Column(name = "error_message", columnDefinition = "TEXT")
     private String errorMessage;
     
     @Column(name = "transaction_id", length = 100)
@@ -54,6 +54,14 @@ public class IfInisisLog {
     public IfInisisLog(String orderNo, String requestType) {
         this.orderNo = orderNo;
         this.requestType = requestType;
+        this.paymentProvider = "INICIS"; // 기본값
+        this.createdAt = LocalDateTime.now();
+    }
+
+    public IfInisisLog(String orderNo, String requestType, String paymentProvider) {
+        this.orderNo = orderNo;
+        this.requestType = requestType;
+        this.paymentProvider = paymentProvider;
         this.createdAt = LocalDateTime.now();
     }
     
@@ -66,6 +74,9 @@ public class IfInisisLog {
     
     public String getRequestType() { return requestType; }
     public void setRequestType(String requestType) { this.requestType = requestType; }
+
+    public String getPaymentProvider() { return paymentProvider; }
+    public void setPaymentProvider(String paymentProvider) { this.paymentProvider = paymentProvider; }
     
     public String getRequestUrl() { return requestUrl; }
     public void setRequestUrl(String requestUrl) { this.requestUrl = requestUrl; }

@@ -55,4 +55,14 @@ public interface PaymentRepository extends JpaRepository<Payment, Long> {
         List<Payment> payments = findByTidAndStatusOrderByPaymentDateDesc(tid, status);
         return payments.isEmpty() ? Optional.empty() : Optional.of(payments.get(0));
     }
+
+    // 주문번호와 TID로 결제 내역 조회 (중복 결제 확인용)
+    @Query("SELECT p FROM Payment p WHERE p.orderNo = :orderNo AND p.tid = :tid " +
+           "ORDER BY p.paymentDate DESC, p.id DESC")
+    List<Payment> findByOrderNoAndTidOrderByPaymentDateDesc(@Param("orderNo") String orderNo, @Param("tid") String tid);
+
+    default Optional<Payment> findByOrderNoAndTid(String orderNo, String tid) {
+        List<Payment> payments = findByOrderNoAndTidOrderByPaymentDateDesc(orderNo, tid);
+        return payments.isEmpty() ? Optional.empty() : Optional.of(payments.get(0));
+    }
 }

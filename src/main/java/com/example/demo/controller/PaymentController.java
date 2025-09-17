@@ -1,13 +1,17 @@
 package com.example.demo.controller;
 
+import com.example.demo.dto.PaymentResultDto;
 import com.example.demo.entity.Order;
 import com.example.demo.entity.PaymentLog;
 import com.example.demo.repository.OrderRepository;
 import com.example.demo.repository.PaymentLogRepository;
 import com.example.demo.service.PaymentService;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.*;
+
+import jakarta.servlet.http.HttpServletRequest;
 
 import java.util.HashMap;
 import java.util.Map;
@@ -50,6 +54,23 @@ public class PaymentController {
         System.out.println("Payment Notify Params: " + params);
         String result = paymentService.processPaymentNotify(params);
         return ResponseEntity.ok(result);
+    }
+
+    @PostMapping("/log-request")
+    public ResponseEntity<?> logPaymentRequest(@RequestBody Map<String, Object> request) {
+        try {
+            String orderNo = (String) request.get("orderNo");
+            String requestType = (String) request.get("requestType");
+            String requestUrl = (String) request.get("requestUrl");
+            Map<String, Object> requestData = (Map<String, Object>) request.get("requestData");
+
+            paymentService.logInicisRequest(orderNo, requestType, requestUrl, requestData);
+
+            return ResponseEntity.ok(Map.of("success", true, "message", "요청 로깅 완료"));
+
+        } catch (Exception e) {
+            return ResponseEntity.badRequest().body(Map.of("success", false, "message", "로깅 실패: " + e.getMessage()));
+        }
     }
 
     @PostMapping("/response")
@@ -369,6 +390,185 @@ public class PaymentController {
             case CANCELLED: return "결제 취소";
             case FAILED: return "결제 실패";
             default: return "알 수 없는 상태";
+        }
+    }
+
+    // 결제 완료 HTML 생성
+    private String generatePaymentCompleteHtml(PaymentResultDto result) {
+        if (result.isSuccess()) {
+            return "<!DOCTYPE html>" +
+                   "<html><head><meta charset='UTF-8'></head><body>" +
+                   "<script>" +
+                   "console.log('NICE Pay 결제 성공:', " + result.getOrderNo() + ");" +
+                   "if (window.opener) {" +
+                   "  window.opener.postMessage({" +
+                   "    type: 'PAYMENT_COMPLETE'," +
+                   "    status: 'success'," +
+                   "    message: '결제가 완료되었습니다.'," +
+                   "    data: {" +
+                   "      orderNo: '" + result.getOrderNo() + "'," +
+                   "      amount: " + (result.getAmount() != null ? result.getAmount() : 0) + "," +
+                   "      tid: '" + (result.getTid() != null ? result.getTid() : "") + "'" +
+                   "    }" +
+                   "  }, '*');" +
+                   "  window.close();" +
+                   "} else {" +
+                   "  document.body.innerHTML = '<h2>결제 완료</h2><p>주문번호: " + result.getOrderNo() + "</p>';" +
+                   "}" +
+                   "</script>" +
+                   "<h2>결제 처리 중...</h2>" +
+                   "</body></html>";
+        } else {
+            return "<!DOCTYPE html>" +
+                   "<html><head><meta charset='UTF-8'></head><body>" +
+                   "<script>" +
+                   "console.log('NICE Pay 결제 실패:', '" + result.getResultMessage() + "');" +
+                   "if (window.opener) {" +
+                   "  window.opener.postMessage({" +
+                   "    type: 'PAYMENT_COMPLETE'," +
+                   "    status: 'failed'," +
+                   "    message: '" + (result.getResultMessage() != null ? result.getResultMessage() : "결제 실패") + "'" +
+                   "  }, '*');" +
+                   "  window.close();" +
+                   "} else {" +
+                   "  document.body.innerHTML = '<h2>결제 실패</h2><p>" + result.getResultMessage() + "</p>';" +
+                   "}" +
+                   "</script>" +
+                   "<h2>결제 처리 중...</h2>" +
+                   "</body></html>";
+        }
+    }
+
+    // 결제 오류 HTML 생성
+    private String generatePaymentErrorHtml(String errorMessage) {
+        return "<!DOCTYPE html>" +
+               "<html><head><meta charset='UTF-8'></head><body>" +
+               "<script>" +
+               "console.error('NICE Pay 처리 오류:', '" + errorMessage + "');" +
+               "if (window.opener) {" +
+               "  window.opener.postMessage({" +
+               "    type: 'PAYMENT_COMPLETE'," +
+               "    status: 'failed'," +
+               "    message: '결제 처리 중 오류가 발생했습니다: " + errorMessage + "'" +
+               "  }, '*');" +
+               "  window.close();" +
+               "} else {" +
+               "  document.body.innerHTML = '<h2>오류 발생</h2><p>" + errorMessage + "</p>';" +
+               "}" +
+               "</script>" +
+               "<h2>오류 처리 중...</h2>" +
+               "</body></html>";
+    }
+
+    // ===== NICE Pay 관련 엔드포인트들 =====
+
+    @PostMapping("/nicepay/request")
+    public ResponseEntity<?> requestNicePayment(@RequestBody Map<String, Object> request) {
+        try {
+            String orderNo = (String) request.get("orderNo");
+            Long amount = Long.valueOf(request.get("amount").toString());
+            String productName = (String) request.get("productName");
+            String buyerName = (String) request.get("buyerName");
+            String buyerEmail = (String) request.get("buyerEmail");
+            String buyerTel = (String) request.get("buyerTel");
+
+            Map<String, Object> result = paymentService.requestNicePayment(orderNo, amount, productName, buyerName, buyerEmail, buyerTel);
+            return ResponseEntity.ok(result);
+
+        } catch (Exception e) {
+            return ResponseEntity.badRequest().body("NICE Pay 결제 요청 중 오류가 발생했습니다: " + e.getMessage());
+        }
+    }
+
+    // NICE Pay Return URL (현재는 프론트엔드에서 처리하므로 사용하지 않음)
+    // 혹시 필요할 경우를 대비해 간단한 로깅만 유지
+    @PostMapping("/nicepay/return")
+    public ResponseEntity<String> handleNicePayReturn(@RequestBody(required = false) Map<String, Object> params) {
+        System.out.println("=== NICE Pay Return (사용하지 않음) ===");
+        System.out.println("Params: " + params);
+        return ResponseEntity.ok("NICE Pay return은 프론트엔드에서 처리됩니다.");
+    }
+
+    @GetMapping("/nicepay/return")
+    public ResponseEntity<String> handleNicePayReturnGet(@RequestParam(required = false) Map<String, Object> params) {
+        System.out.println("=== NICE Pay Return GET (사용하지 않음) ===");
+        System.out.println("Params: " + params);
+        return ResponseEntity.ok("NICE Pay return은 프론트엔드에서 처리됩니다.");
+    }
+
+    @PostMapping("/nicepay/notify")
+    public ResponseEntity<?> handleNicePayNotify(@RequestBody Map<String, Object> params) {
+        System.out.println("=== NICE Pay Notify (프론트엔드에서 호출) ===");
+        System.out.println("Params: " + params);
+
+        try {
+            PaymentResultDto result = paymentService.handleNicePayResponse(params);
+
+            System.out.println("Processing result - Success: " + result.isSuccess() + ", OrderNo: " + result.getOrderNo());
+
+            // Inicis와 동일한 JSON 응답 형태로 반환
+            return ResponseEntity.ok(result);
+
+        } catch (Exception e) {
+            System.err.println("NICE Pay Notify Error: " + e.getMessage());
+            e.printStackTrace();
+
+            // 에러 시에도 JSON 형태로 응답
+            PaymentResultDto errorResult = new PaymentResultDto();
+            errorResult.setSuccess(false);
+            errorResult.setResultMessage("결제 처리 중 오류가 발생했습니다: " + e.getMessage());
+            return ResponseEntity.ok(errorResult);
+        }
+    }
+
+    @PostMapping("/nicepay/close")
+    public ResponseEntity<String> handleNicePayClose(@RequestBody Map<String, Object> params) {
+        System.out.println("NICE Pay Close Params: " + params);
+        // 결제창 닫기 처리 (필요시 추가 로직 구현)
+        return ResponseEntity.ok("OK");
+    }
+
+    @PostMapping("/nicepay/cancel")
+    public ResponseEntity<String> handleNicePayCancel(@RequestBody Map<String, Object> params) {
+        System.out.println("NICE Pay Cancel Params: " + params);
+        // 결제 취소 처리 (필요시 추가 로직 구현)
+        return ResponseEntity.ok("OK");
+    }
+
+    @PostMapping("/nicepay/approve")
+    public ResponseEntity<?> approveNicePayPayment(@RequestBody Map<String, Object> params) {
+        System.out.println("=== NICE Pay 승인 API 호출 ===");
+        System.out.println("인증 응답 파라미터: " + params);
+
+        try {
+            Map<String, Object> result = paymentService.approveNicePayPayment(params);
+            System.out.println("승인 처리 결과: " + result);
+            return ResponseEntity.ok(result);
+
+        } catch (Exception e) {
+            System.err.println("NICE Pay 승인 처리 오류: " + e.getMessage());
+            e.printStackTrace();
+
+            return ResponseEntity.ok(Map.of(
+                "success", false,
+                "resultCode", "APPROVAL_ERROR",
+                "resultMessage", "승인 처리 중 오류가 발생했습니다: " + e.getMessage()
+            ));
+        }
+    }
+
+    @PostMapping("/nicepay/refund")
+    public ResponseEntity<?> refundNicePayment(@RequestBody Map<String, Object> request) {
+        try {
+            String tid = (String) request.get("tid");
+            Long amount = Long.valueOf(request.get("amount").toString());
+            String reason = (String) request.get("reason");
+
+            Map<String, Object> result = paymentService.cancelNicePayment(tid, amount, reason);
+            return ResponseEntity.ok(result);
+
+        } catch (Exception e) {
+            return ResponseEntity.badRequest().body("NICE Pay 환불 처리 중 오류가 발생했습니다: " + e.getMessage());
         }
     }
 }
