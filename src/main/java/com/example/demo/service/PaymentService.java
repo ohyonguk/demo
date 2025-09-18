@@ -81,11 +81,20 @@ public class PaymentService {
         restTemplate.getRequestFactory();
     }
     
-    // 이니시스 설정
-    private static final String INICIS_API_URL = "https://stgstdpay.inicis.com/api/v1/formpay";
-    private static final String INICIS_REFUND_URL = "https://iniapi.inicis.com/v2/pg/refund";
+    // 이니시스 설정 (환경별)
+    @Value("${inicis.api.url}")
+    private String inicisApiUrl;
 
-    // NICE Pay 설정
+    @Value("${inicis.refund.url}")
+    private String inicisRefundUrl;
+
+    @Value("${inicis.merchant.id}")
+    private String inicisMerchantId;
+
+    @Value("${inicis.sign.key}")
+    private String inicisSignKey;
+
+    // NICE Pay 설정 (환경별)
     @Value("${nicepay.merchant.id}")
     private String nicePayMerchantId;
 
@@ -97,9 +106,6 @@ public class PaymentService {
 
     @Value("${nicepay.cancel.pwd}")
     private String nicePayCancelPwd;
-    private static final String MID = "INIpayTest";
-    private static final String SIGN_KEY = "SU5JTElURV9UUklQTEVERVNfS0VZU1RS";
-    private static final String INI_API_KEY = "ItEQKi3rY7uvDS8l";
     
     
     public PaymentResultDto processInicisCallback(InicisResponseDto inicisResponse) {
