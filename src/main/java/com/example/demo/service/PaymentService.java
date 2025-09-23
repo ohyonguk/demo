@@ -134,6 +134,10 @@ public class PaymentService {
     @Value("${nicepay.api.url}")
     private String nicePayApiUrl;
 
+    // FO 도메인 설정 (환경별)
+    @Value("${fo.domain}")
+    private String foDomain;
+
     
     
     
@@ -2233,8 +2237,8 @@ public class PaymentService {
         data.put("BuyerEmail", buyerEmail != null ? buyerEmail : "test@test.com");
         data.put("BuyerTel", buyerTel != null ? buyerTel : "010-0000-0000");
         // PC 결제는 ReturnURL 사용하지 않음 (콜백 함수 사용)
-        data.put("CloseURL", "http://localhost:8081/api/payment/nicepay/close");
-        data.put("CancelURL", "http://localhost:8081/api/payment/nicepay/cancel");
+        data.put("CloseURL", foDomain + "/api/payment/nicepay/close");
+        data.put("CancelURL", foDomain + "/api/payment/nicepay/cancel");
         data.put("PayMethod", "CARD");
         data.put("GoodsCl", "1"); // 실물
         data.put("TransType", "0"); // 일반결제
