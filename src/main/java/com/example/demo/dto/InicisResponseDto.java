@@ -23,6 +23,7 @@ public class InicisResponseDto {
     private String cardBankCode;
     private String cardBankName;
     private String cardCloseDate;
+    private String netCancelUrl; // 망취소 전용 URL
     
     public InicisResponseDto() {}
     
@@ -88,7 +89,10 @@ public class InicisResponseDto {
     
     public String getCardCloseDate() { return cardCloseDate; }
     public void setCardCloseDate(String cardCloseDate) { this.cardCloseDate = cardCloseDate; }
-    
+
+    public String getNetCancelUrl() { return netCancelUrl; }
+    public void setNetCancelUrl(String netCancelUrl) { this.netCancelUrl = netCancelUrl; }
+
     public boolean isSuccess() {
         return "0000".equals(resultCode);
     }

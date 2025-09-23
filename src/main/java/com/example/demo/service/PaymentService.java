@@ -1,35 +1,13 @@
 package com.example.demo.service;
 
-import com.example.demo.dto.InicisResponseDto;
-import com.example.demo.dto.PaymentResultDto;
-import com.example.demo.entity.Order;
-import com.example.demo.entity.Payment;
-import com.example.demo.entity.PaymentLog;
-import com.example.demo.entity.User;
-import com.example.demo.mapper.PaymentMapper;
-import com.example.demo.repository.OrderRepository;
-import com.example.demo.repository.PaymentLogRepository;
-import com.example.demo.repository.PaymentRepository;
-import com.example.demo.repository.UserRepository;
-import com.example.demo.entity.IfInisisLog;
-import com.example.demo.repository.IfInisisLogRepository;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
-import org.springframework.beans.factory.annotation.Autowired;
-import org.springframework.beans.factory.annotation.Value;
-import org.springframework.stereotype.Service;
-import org.springframework.transaction.annotation.Transactional;
-import org.springframework.web.client.RestTemplate;
-import org.springframework.http.HttpEntity;
-import org.springframework.http.HttpHeaders;
-import org.springframework.http.MediaType;
-import org.springframework.http.ResponseEntity;
-import org.springframework.util.MultiValueMap;
-import org.springframework.util.LinkedMultiValueMap;
-import com.fasterxml.jackson.databind.ObjectMapper;
-import com.fasterxml.jackson.core.JsonProcessingException;
-import com.fasterxml.jackson.databind.SerializationFeature;
-
+import java.io.BufferedReader;
+import java.io.InputStreamReader;
+import java.io.OutputStream;
+import java.net.HttpURLConnection;
+import java.net.URL;
+import java.net.URLDecoder;
+import java.net.URLEncoder;
+import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
@@ -40,7 +18,37 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.UUID;
-import java.nio.charset.StandardCharsets;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.http.HttpEntity;
+import org.springframework.http.HttpHeaders;
+import org.springframework.http.MediaType;
+import org.springframework.http.ResponseEntity;
+import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Propagation;
+import org.springframework.transaction.annotation.Transactional;
+import org.springframework.util.LinkedMultiValueMap;
+import org.springframework.util.MultiValueMap;
+import org.springframework.web.client.RestTemplate;
+
+import com.example.demo.dto.PaymentResultDto;
+import com.example.demo.entity.IfInisisLog;
+import com.example.demo.entity.Order;
+import com.example.demo.entity.Payment;
+import com.example.demo.entity.PaymentLog;
+import com.example.demo.entity.User;
+import com.example.demo.mapper.PaymentMapper;
+import com.example.demo.repository.IfInisisLogRepository;
+import com.example.demo.repository.OrderRepository;
+import com.example.demo.repository.PaymentLogRepository;
+import com.example.demo.repository.PaymentRepository;
+import com.example.demo.repository.UserRepository;
+import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.SerializationFeature;
 
 @Service
 @Transactional
@@ -94,6 +102,9 @@ public class PaymentService {
     @Value("${inicis.sign.key}")
     private String inicisSignKey;
 
+    @Value("${inicis.api.key}")
+    private String inicisApiKey;
+
     // NICE Pay 설정 (환경별)
     @Value("${nicepay.merchant.id}")
     private String nicePayMerchantId;
@@ -104,49 +115,8 @@ public class PaymentService {
     @Value("${nicepay.api.url}")
     private String nicePayApiUrl;
 
-    @Value("${nicepay.cancel.pwd}")
-    private String nicePayCancelPwd;
     
     
-    public PaymentResultDto processInicisCallback(InicisResponseDto inicisResponse) {
-        logger.info("Processing Inicis callback for order: {}", inicisResponse.getOid());
-        
-        try {
-            // 서명 검증 (실제 운영환경에서는 이니시스 키로 검증해야 함)
-            if (!verifySignature(inicisResponse)) {
-                logger.warn("Invalid signature for order: {}", inicisResponse.getOid());
-                throw new IllegalArgumentException("유효하지 않은 서명입니다.");
-            }
-            
-            // 기존 완료된 결제 정보 확인
-            List<Payment> existingPayments = paymentRepository.findByOrderNoAndStatusCompleted(inicisResponse.getOid());
-            Optional<Payment> existingPayment = existingPayments.isEmpty() ? Optional.empty() : Optional.of(existingPayments.get(0));
-            
-            Payment payment;
-            if (existingPayment.isPresent()) {
-                // 기존 결제 정보 업데이트
-                payment = existingPayment.get();
-                updatePaymentFromInicisResponse(payment, inicisResponse);
-                logger.info("Updated existing payment for order: {}", inicisResponse.getOid());
-            } else {
-                // 새 결제 정보 저장
-                payment = paymentMapper.toPaymentEntity(inicisResponse);
-                logger.info("Created new payment for order: {}", inicisResponse.getOid());
-            }
-            
-            Payment savedPayment = paymentRepository.save(payment);
-            PaymentResultDto result = paymentMapper.toPaymentResultDto(inicisResponse);
-            
-            logger.info("Payment processing completed for order: {} with status: {}", 
-                       savedPayment.getOrderNo(), savedPayment.getStatus());
-            
-            return result;
-            
-        } catch (Exception e) {
-            logger.error("Error processing payment callback for order: {}", inicisResponse.getOid(), e);
-            throw new RuntimeException("결제 처리 중 오류가 발생했습니다.", e);
-        }
-    }
     
     public Optional<Payment> getPaymentByOrderNo(String orderNo) {
         List<Payment> payments = paymentRepository.findByOrderNoOrderByPaymentDateDesc(orderNo);
@@ -158,23 +128,16 @@ public class PaymentService {
         return !payments.isEmpty();
     }
     
-    private boolean verifySignature(InicisResponseDto response) {
-        // 실제 운영환경에서는 이니시스에서 제공하는 키로 서명을 검증해야 합니다
-        // 여기서는 기본적인 검증만 수행합니다
-        try {
-            String signatureData = response.getOid() + response.getPrice() + response.getTimestamp();
-            // 실제로는 이니시스 키와 함께 SHA256 해시를 생성하여 비교해야 합니다
-            return response.getSignature() != null && !response.getSignature().isEmpty();
-        } catch (Exception e) {
-            logger.error("Signature verification failed", e);
-            return false;
-        }
-    }
     
-    // 주문 생성
+    // 주문 생성 (오버로드 - 기존 호환성)
     public Map<String, Object> createOrder(Long userId, Long totalAmount, Integer pointsUsed, Long cardAmount) {
-        logger.info("Creating order - userId: {}, totalAmount: {}, pointsUsed: {}, cardAmount: {}", 
-                   userId, totalAmount, pointsUsed, cardAmount);
+        return createOrder(userId, totalAmount, pointsUsed, cardAmount, false);
+    }
+
+    // 주문 생성
+    public Map<String, Object> createOrder(Long userId, Long totalAmount, Integer pointsUsed, Long cardAmount, Boolean isNetworkCancelTest) {
+        logger.info("Creating order - userId: {}, totalAmount: {}, pointsUsed: {}, cardAmount: {}, isNetworkCancelTest: {}",
+                   userId, totalAmount, pointsUsed, cardAmount, isNetworkCancelTest);
         
         Optional<User> userOpt = userRepository.findById(userId);
         if (userOpt.isEmpty()) {
@@ -187,6 +150,12 @@ public class PaymentService {
         }
         
         String orderNo = "ORD" + System.currentTimeMillis() + UUID.randomUUID().toString().substring(0, 8);
+
+        // 망취소 테스트 모드인 경우 주문번호에 NETCANCEL 키워드 추가
+        if (isNetworkCancelTest != null && isNetworkCancelTest) {
+            orderNo = orderNo + "_NETCANCEL";
+            logger.info("망취소 테스트 모드: 주문번호에 NETCANCEL 키워드 추가 - {}", orderNo);
+        }
         
         Order order = new Order(orderNo, userId, totalAmount, pointsUsed, cardAmount, Order.OrderStatus.PENDING);
         orderRepository.save(order);
@@ -198,6 +167,7 @@ public class PaymentService {
         if (pointsUsed > 0) {
             Payment pointPayment = new Payment();
             pointPayment.setOrderNo(orderNo);
+            pointPayment.setUserId(userId);
             pointPayment.setTid("POINTS_" + System.currentTimeMillis());
             pointPayment.setAmount(Long.valueOf(pointsUsed));
             pointPayment.setStatus("COMPLETED");
@@ -280,7 +250,19 @@ public class PaymentService {
             PaymentLog paymentLog = createOrUpdatePaymentLog(order, tid, resultCode, resultMsg);
             
             if ("0000".equals(resultCode)) {
-                processSuccessfulPayment(order, paymentLog);
+                logger.info("Processing successful payment for order: {}", order.getOrderNo());
+
+                // Notify 콜백에서는 단순히 결제 완료 처리 (승인은 이미 완료된 상태)
+                paymentLog.setApprovedAt(LocalDateTime.now());
+                order.setStatus(Order.OrderStatus.APPROVED);
+                order.setStatus(Order.OrderStatus.COMPLETED);
+
+                // payments 테이블에 결제 정보 저장
+                savePaymentRecord(order, paymentLog);
+
+                // 보너스 포인트 적립
+                processPaymentSuccess(order);
+                logger.info("Payment approved and completed: {}", order.getOrderNo());
             } else {
                 processFailedPayment(order, paymentLog, resultCode, resultMsg);
             }
@@ -311,6 +293,7 @@ public class PaymentService {
             String tid = extractTransactionId(params);
             String authUrl = (String) params.get("authUrl");
             String authToken = (String) params.get("authToken");
+            String netCancelUrl = (String) params.get("netCancelUrl");
 
             // 이니시스 로그 생성 및 요청 데이터 저장
             inicisLog = createInicisLog(orderNo, "PAYMENT_RESPONSE", null, params);
@@ -333,17 +316,44 @@ public class PaymentService {
                 // 인증 결과에 따라 처리
                 String authResultCode = (String) authResult.get("code");
                 if ("0000".equals(authResultCode)) {
-                    processSuccessfulPayment(order, paymentLog, authResult);
+                    logger.info("Processing successful payment with auth result for order: {}", order.getOrderNo());
+
+                    // 인증 결과에서 실제 TID가 있으면 PaymentLog 업데이트
+                    String realTid = (String) authResult.get("tid");
+                    if (realTid != null && !realTid.trim().isEmpty() && !realTid.startsWith("TEMP_TID_")) {
+                        logger.info("Updating PaymentLog TID from {} to {}", paymentLog.getTransactionId(), realTid);
+                        paymentLog.setTransactionId(realTid);
+                    }
+
+                    paymentLog.setApprovedAt(LocalDateTime.now());
+                    order.setStatus(Order.OrderStatus.APPROVED);
+                    order.setStatus(Order.OrderStatus.COMPLETED);
+
+                    // netCancelUrl이 params에 있으면 authResult에 추가
+                    if (netCancelUrl != null && !netCancelUrl.trim().isEmpty()) {
+                        authResult.put("netCancelUrl", netCancelUrl);
+                        logger.info("params에서 netCancelUrl 추가: {}", netCancelUrl);
+                    }
+
+                    // authToken도 망취소에 필요하므로 authResult에 추가
+                    if (authToken != null && !authToken.trim().isEmpty()) {
+                        authResult.put("authToken", authToken);
+                        logger.info("params에서 authToken 추가 (망취소용)");
+                    }
+
+                    // payments 테이블에 결제 정보 저장 (인증 결과 포함)
+                    savePaymentRecordWithAuthResult(order, paymentLog, authResult);
+
+                    // 보너스 포인트 적립
+                    processPaymentSuccess(order);
+                    logger.info("Payment approved and completed with auth: {}", order.getOrderNo());
                 } else {
                     processFailedPayment(order, paymentLog, authResultCode, (String) authResult.get("message"));
                 }
             } else {
-                // 기존 로직
-                if ("0000".equals(resultCode)) {
-                    processSuccessfulPayment(order, paymentLog);
-                } else {
-                    processFailedPayment(order, paymentLog, resultCode, resultMsg);
-                }
+                // authUrl이나 authToken이 없는 경우 오류 처리
+                logger.error("Missing authUrl or authToken for order: {}", orderNo);
+                processFailedPayment(order, paymentLog, "9999", "인증 정보가 없습니다.");
             }
             
             savePaymentLogWithVerification(paymentLog);
@@ -452,52 +462,7 @@ public class PaymentService {
         return paymentLog;
     }
     
-    // 성공한 결제 처리 (기존)
-    private void processSuccessfulPayment(Order order, PaymentLog paymentLog) {
-        logger.info("Processing successful payment for order: {}", order.getOrderNo());
-        
-        if (processInicisApproval(paymentLog.getTransactionId(), order.getOrderNo(), order.getCardAmount())) {
-            paymentLog.setApprovedAt(LocalDateTime.now());
-            order.setStatus(Order.OrderStatus.APPROVED);
-            order.setStatus(Order.OrderStatus.COMPLETED);
-            
-            // payments 테이블에 결제 정보 저장
-            savePaymentRecord(order, paymentLog);
-            
-            // 보너스 포인트 적립
-            processPaymentSuccess(order);
-            logger.info("Payment approved and completed: {}", order.getOrderNo());
-        } else {
-            order.setStatus(Order.OrderStatus.FAILED);
-            paymentLog.setStatus(PaymentLog.PaymentStatus.FAILED);
-            paymentLog.setResultMessage("이니시스 승인 처리 실패");
-            restoreUserPoints(order);
-            logger.warn("Inicis approval failed for: {}", order.getOrderNo());
-        }
-    }
     
-    // 성공한 결제 처리 (인증 결과 포함)
-    private void processSuccessfulPayment(Order order, PaymentLog paymentLog, Map<String, Object> authResult) {
-        logger.info("Processing successful payment with auth result for order: {}", order.getOrderNo());
-
-        // 인증 결과에서 실제 TID가 있으면 PaymentLog 업데이트
-        String realTid = (String) authResult.get("tid");
-        if (realTid != null && !realTid.trim().isEmpty() && !realTid.startsWith("TEMP_TID_")) {
-            logger.info("Updating PaymentLog TID from {} to {}", paymentLog.getTransactionId(), realTid);
-            paymentLog.setTransactionId(realTid);
-        }
-
-        paymentLog.setApprovedAt(LocalDateTime.now());
-        order.setStatus(Order.OrderStatus.APPROVED);
-        order.setStatus(Order.OrderStatus.COMPLETED);
-
-        // payments 테이블에 결제 정보 저장 (인증 결과 포함)
-        savePaymentRecordWithAuthResult(order, paymentLog, authResult);
-
-        // 보너스 포인트 적립
-        processPaymentSuccess(order);
-        logger.info("Payment approved and completed with auth: {}", order.getOrderNo());
-    }
     
     // 실패한 결제 처리
     private void processFailedPayment(Order order, PaymentLog paymentLog, String resultCode, String resultMsg) {
@@ -514,12 +479,14 @@ public class PaymentService {
         try {
             Payment payment = new Payment();
             payment.setOrderNo(order.getOrderNo());
+            payment.setUserId(order.getUserId());
             payment.setTid(paymentLog.getTransactionId());
             payment.setAmount(order.getCardAmount());
             payment.setResultCode(resultCode);
             payment.setResultMsg(resultMsg);
             payment.setStatus("FAILED");
             payment.setPaymentType(Payment.PaymentType.CARD.name());
+            payment.setPgProvider("INICIS");
             payment.setPaymentDate(LocalDateTime.now());
             payment.setCardName("결제실패");
             payment.setCanRefund(false);
@@ -569,7 +536,7 @@ public class PaymentService {
             // API 요청 데이터 준비
             Map<String, String> requestData = new HashMap<>();
             requestData.put("version", "1.0");
-            requestData.put("mid", MID);
+            requestData.put("mid", inicisMerchantId);
             requestData.put("oid", orderNo);
             requestData.put("price", amount.toString());
             requestData.put("timestamp", timestamp);
@@ -598,7 +565,7 @@ public class PaymentService {
             
             // API 호출
             try {
-                ResponseEntity<String> response = restTemplate.postForEntity(INICIS_API_URL, request, String.class);
+                ResponseEntity<String> response = restTemplate.postForEntity(inicisApiUrl, request, String.class);
                 String responseBody = response.getBody();
                 
                 logger.info("Inicis API response status: {}", response.getStatusCode());
@@ -645,7 +612,7 @@ public class PaymentService {
     // 검증 값 생성 (oid + price + signKey + timestamp) - 기존 방식
     private String generateVerification(String oid, String price, String timestamp) {
         try {
-            String data = "oid=" + oid + "&price=" + price + "&signKey=" + SIGN_KEY + "&timestamp=" + timestamp;
+            String data = "oid=" + oid + "&price=" + price + "&signKey=" + inicisSignKey + "&timestamp=" + timestamp;
             return sha256Hash(data);
         } catch (Exception e) {
             logger.error("Error generating verification", e);
@@ -668,7 +635,7 @@ public class PaymentService {
     // 승인 요청용 검증 값 생성 (NVP 방식: authToken + signKey + timestamp)
     private String generateAuthVerification(String authToken, String timestamp) {
         try {
-            String data = "authToken=" + authToken + "&signKey=" + SIGN_KEY + "&timestamp=" + timestamp;
+            String data = "authToken=" + authToken + "&signKey=" + inicisSignKey + "&timestamp=" + timestamp;
             logger.debug("Auth verification data: {}", data);
             return sha256Hash(data);
         } catch (Exception e) {
@@ -680,7 +647,7 @@ public class PaymentService {
     // mKey 생성 (signKey의 SHA256 해시)
     private String generateMKey() {
         try {
-            return sha256Hash(SIGN_KEY);
+            return sha256Hash(inicisSignKey);
         } catch (Exception e) {
             logger.error("Error generating mKey", e);
             return "";
@@ -749,13 +716,15 @@ public class PaymentService {
             
             String tid = paymentLog.getTransactionId();
             logger.info("TID from PaymentLog: {}", tid);
-            
+
             Payment payment = new Payment();
             payment.setOrderNo(order.getOrderNo());
+            payment.setUserId(order.getUserId());
             payment.setTid(tid);
             payment.setAmount(order.getCardAmount()); // 카드 결제 금액만 저장
             payment.setStatus("COMPLETED");
             payment.setPaymentType(Payment.PaymentType.CARD.name());
+            payment.setPgProvider("INICIS");
             payment.setResultCode(paymentLog.getResultCode());
             payment.setResultMsg(paymentLog.getResultMessage());
             payment.setPaymentDate(paymentLog.getApprovedAt());
@@ -801,7 +770,7 @@ public class PaymentService {
             
             // API 요청 객체 생성
             Map<String, Object> requestData = new HashMap<>();
-            requestData.put("mid", MID);
+            requestData.put("mid", inicisMerchantId);
             requestData.put("authToken", authToken);
             requestData.put("timestamp", timestamp);
             requestData.put("signature", signature);
@@ -821,7 +790,7 @@ public class PaymentService {
                 logger.info("AuthToken: {}", authToken);
                 logger.info("Timestamp: {}", timestamp);
                 logger.info("Signature NVP: authToken={}&timestamp={}", authToken, timestamp);
-                logger.info("Verification NVP: authToken={}&signKey={}&timestamp={}", authToken, SIGN_KEY, timestamp);
+                logger.info("Verification NVP: authToken={}&signKey={}&timestamp={}", authToken, inicisSignKey, timestamp);
                 logger.info("Generated Signature: {}", signature);
                 logger.info("Generated Verification: {}", verification);
                 logger.info("Request JSON:\n{}", prettyRequestJson);
@@ -895,6 +864,15 @@ public class PaymentService {
 
                             // 카드 정보 추출 (다양한 키 패턴 지원)
                             extractCardInfo(parsedResponse, responseData);
+
+                            // netCancelUrl 추출 (Inicis 인증 응답에서)
+                            String netCancelUrl = extractNetCancelUrl(parsedResponse);
+                            if (netCancelUrl != null && !netCancelUrl.trim().isEmpty()) {
+                                responseData.put("netCancelUrl", netCancelUrl);
+                                logger.info("Inicis 인증 응답에서 netCancelUrl 추출 성공: {}", netCancelUrl);
+                            } else {
+                                logger.info("Inicis 인증 응답에 netCancelUrl 없음 (테스트 환경에서는 정상)");
+                            }
                         }
                     } catch (Exception parseException) {
                         logger.warn("Failed to parse auth response for TID extraction: {}", parseException.getMessage());
@@ -1048,6 +1026,26 @@ public class PaymentService {
                    responseData.get("cardName"), responseData.get("cardCode"), responseData.get("applNum"));
     }
 
+    // Inicis 인증 응답에서 netCancelUrl 추출
+    private String extractNetCancelUrl(Map<String, Object> response) {
+        if (response == null) return null;
+
+        // Inicis 응답에서 netCancelUrl을 찾는 다양한 키들
+        String[] netCancelUrlKeys = {"netCancelUrl", "net_cancel_url", "NetCancelUrl", "NET_CANCEL_URL", "authUrl"};
+
+        for (String key : netCancelUrlKeys) {
+            Object value = response.get(key);
+            if (value != null && !value.toString().trim().isEmpty()) {
+                String url = value.toString().trim();
+                logger.info("Inicis 응답에서 netCancelUrl 발견 (키: {}): {}", key, url);
+                return url;
+            }
+        }
+
+        logger.debug("Inicis 응답에서 netCancelUrl을 찾을 수 없음. 응답 키들: {}", response.keySet());
+        return null;
+    }
+
     // 이니시스 응답에서 실제 TID 추출
     private String extractRealTidFromResponse(Map<String, Object> response) {
         if (response == null) return null;
@@ -1083,13 +1081,15 @@ public class PaymentService {
             }
             logger.info("TID for payment record (auth): {} (from authResult: {})",
                        tid, authResult.get("tid"));
-            
+
             Payment payment = new Payment();
             payment.setOrderNo(order.getOrderNo());
+            payment.setUserId(order.getUserId());
             payment.setTid(tid);
             payment.setAmount(order.getCardAmount()); // 카드 결제 금액만 저장
             payment.setStatus("COMPLETED");
             payment.setPaymentType(Payment.PaymentType.CARD.name());
+            payment.setPgProvider("INICIS");
             payment.setResultCode((String) authResult.get("code"));
             payment.setResultMsg((String) authResult.get("message"));
             payment.setPaymentDate(paymentLog.getApprovedAt());
@@ -1104,10 +1104,43 @@ public class PaymentService {
             if (authResult.containsKey("applNum")) {
                 payment.setApplNum((String) authResult.get("applNum"));
             }
+
+            // netCancelUrl 저장 (Inicis 인증 응답에서 추출된 값)
+            if (authResult.containsKey("netCancelUrl")) {
+                String netCancelUrl = (String) authResult.get("netCancelUrl");
+                payment.setNetCancelUrl(netCancelUrl);
+                logger.info("Inicis netCancelUrl 저장 성공: {}", netCancelUrl);
+            } else {
+                logger.info("Inicis 인증 응답에 netCancelUrl 없음 (테스트 환경에서는 정상)");
+            }
+
+            // authToken 저장 (망취소 시 필요)
+            if (authResult.containsKey("authToken")) {
+                String authToken = (String) authResult.get("authToken");
+                payment.setAuthToken(authToken);
+                logger.info("Inicis authToken 저장 성공 (망취소용)");
+            } else {
+                logger.info("authToken 없음 - 망취소 불가");
+            }
             
+
+            // 망취소 테스트 자동 실행 비활성화 (수동 망취소 버튼으로 대체)
+            // if (order.getOrderNo().contains("NETCANCEL")) {
+            //     logger.info("=== Inicis 망취소 테스트 감지 - 승인 완료 후 망취소 실행 ===");
+            //     ... 망취소 로직 ...
+            // } else {
+
+            // authToken이 없는 경우에만 기본값 설정 (기존 값 보존)
+            if (payment.getAuthToken() == null || payment.getAuthToken().trim().isEmpty()) {
+                payment.setAuthToken(""); // 빈 값으로 설정 (기본값)
+                logger.warn("authToken이 없어서 빈 값으로 설정 - 망취소 불가능할 수 있음");
+            }
+
             paymentRepository.save(payment);
-            logger.info("Payment record with auth result saved - Order: {}, Payment ID: {}, TID: {}", 
-                       order.getOrderNo(), payment.getId(), payment.getTid());
+            logger.info("Payment record with auth result saved - Order: {}, Payment ID: {}, TID: {}, AuthToken: {}",
+                   order.getOrderNo(), payment.getId(), payment.getTid(),
+                   payment.getAuthToken() != null && !payment.getAuthToken().isEmpty() ? "있음" : "없음");
+            // }
             
         } catch (Exception e) {
             logger.error("Error saving payment record with auth result for order: {}, error: {}", 
@@ -1115,20 +1148,46 @@ public class PaymentService {
         }
     }
 
-    // 사용자별 결제 내역 조회
+    // 사용자별 결제 내역 조회 (주문별로 그룹핑)
     public Map<String, Object> getUserPaymentHistory(Long userId) {
         try {
             logger.info("Getting payment history for user: {}", userId);
-            
-            List<Payment> payments = paymentRepository.findByUserIdOrderByPaymentDateDesc(userId);
-            
+
+            // 사용자의 모든 주문 조회
+            List<Order> orders = orderRepository.findByUserIdOrderByCreatedAtDesc(userId);
+
+            // 각 주문에 대한 결제 정보 추가
+            List<Map<String, Object>> orderDetails = new ArrayList<>();
+
+            for (Order order : orders) {
+                List<Payment> payments = paymentRepository.findByOrderNoOrderByPaymentDateDesc(order.getOrderNo());
+
+                Map<String, Object> orderDetail = new HashMap<>();
+                orderDetail.put("orderId", order.getId());
+                orderDetail.put("orderNo", order.getOrderNo());
+                orderDetail.put("totalAmount", order.getTotalAmount());
+                orderDetail.put("cardAmount", order.getCardAmount());
+                orderDetail.put("pointsUsed", order.getPointsUsed());
+                orderDetail.put("status", order.getStatus().name());
+                orderDetail.put("statusMessage", getOrderStatusMessage(order.getStatus()));
+                orderDetail.put("createdAt", order.getCreatedAt());
+                orderDetail.put("updatedAt", order.getUpdatedAt());
+                orderDetail.put("payments", payments);
+
+                // 대표 결제 정보 (가장 최신)
+                Payment primaryPayment = payments.isEmpty() ? null : payments.get(0);
+                orderDetail.put("payment", primaryPayment);
+
+                orderDetails.add(orderDetail);
+            }
+
             return Map.of(
                 "success", true,
                 "userId", userId,
-                "payments", payments,
-                "totalCount", payments.size()
+                "orders", orderDetails,
+                "totalCount", orderDetails.size()
             );
-            
+
         } catch (Exception e) {
             logger.error("Error getting payment history for user: {}", userId, e);
             return Map.of(
@@ -1137,6 +1196,7 @@ public class PaymentService {
             );
         }
     }
+
     
     // 사용자별 주문 내역과 결제 정보 조회 (조인)
     public Map<String, Object> getUserOrdersWithPayments(Long userId) {
@@ -1416,9 +1476,35 @@ public class PaymentService {
                     "message", "결제의 거래 ID(TID)가 없어 취소할 수 없습니다."
                 );
             }
-            
-            // 이니시스 취소 API 호출
-            Map<String, Object> refundResult = callInicisRefundAPI(tid, refundReason, clientIp);
+
+            // PG사 구분하여 적절한 취소 API 호출
+            Map<String, Object> refundResult;
+
+            // pgProvider 컬럼을 통해 PG사 구분
+            String pgProvider = payment.getPgProvider();
+            if ("NICEPAY".equals(pgProvider)) {
+                logger.info("NicePay 거래 취소 요청 - TID: {}, PgProvider: {}", tid, pgProvider);
+                refundResult = cancelNicePayment(tid, payment.getAmount(), refundReason, payment.getOrderNo());
+
+                // NicePay 결과를 Inicis 형식으로 변환
+                if ((Boolean) refundResult.get("success")) {
+                    refundResult = Map.of(
+                        "resultCode", "00",
+                        "resultMsg", "취소 완료",
+                        "originalResult", refundResult
+                    );
+                } else {
+                    refundResult = Map.of(
+                        "resultCode", "99",
+                        "resultMsg", "취소 실패: " + refundResult.get("resultMessage"),
+                        "originalResult", refundResult
+                    );
+                }
+            } else {
+                // pgProvider가 null이거나 INICIS인 경우 (기존 데이터 호환성)
+                logger.info("Inicis 거래 취소 요청 - TID: {}, PgProvider: {}", tid, pgProvider);
+                refundResult = callInicisRefundAPI(tid, refundReason, clientIp);
+            }
             
             String resultCode = (String) refundResult.get("resultCode");
             if ("00".equals(resultCode)) {
@@ -1466,6 +1552,7 @@ public class PaymentService {
             case COMPLETED: return "주문 완료";
             case CANCELLED: return "주문 취소";
             case FAILED: return "주문 실패";
+            case NETWORK_CANCELLED: return "망취소";
             default: return "알 수 없는 상태";
         }
     }
@@ -1545,12 +1632,12 @@ public class PaymentService {
             
             // hashData 생성 (SHA512): INIAPIKey + mid + type + timestamp + data
             String dataJson = objectMapper.writeValueAsString(data);
-            String hashSource = INI_API_KEY + MID + "refund" + timestamp + dataJson;
+            String hashSource = inicisApiKey + inicisMerchantId + "refund" + timestamp + dataJson;
             String hashData = sha512Hash(hashSource);
             
             // 요청 데이터 생성
             Map<String, Object> requestData = new HashMap<>();
-            requestData.put("mid", MID);
+            requestData.put("mid", inicisMerchantId);
             requestData.put("type", "refund");
             requestData.put("timestamp", timestamp);
             requestData.put("clientIp", clientIp);
@@ -1559,7 +1646,7 @@ public class PaymentService {
             
             logger.info("=== 취소 요청 REQUEST DATA ===");
             logger.info("TID: {}", tid);
-            logger.info("Refund URL: {}", INICIS_REFUND_URL);
+            logger.info("Refund URL: {}", inicisRefundUrl);
             logger.info("Hash Source: {}", hashSource);
             logger.info("Generated Hash: {}", hashData);
             logger.info("Request JSON:\n{}", objectMapper.writerWithDefaultPrettyPrinter().writeValueAsString(requestData));
@@ -1572,7 +1659,7 @@ public class PaymentService {
             // HTTP 요청 생성 및 전송
             HttpEntity<Map<String, Object>> request = new HttpEntity<>(requestData, headers);
             
-            ResponseEntity<String> response = restTemplate.postForEntity(INICIS_REFUND_URL, request, String.class);
+            ResponseEntity<String> response = restTemplate.postForEntity(inicisRefundUrl, request, String.class);
             String responseBody = response.getBody();
             
             logger.info("=== 취소 응답 RESPONSE DATA ===");
@@ -1608,10 +1695,12 @@ public class PaymentService {
             
             Payment refundPayment = new Payment();
             refundPayment.setOrderNo(originalPayment.getOrderNo());
+            refundPayment.setUserId(originalPayment.getUserId());
             refundPayment.setTid(originalPayment.getTid());
             refundPayment.setAmount(-originalPayment.getAmount()); // 음수로 저장하여 취소 표시
             refundPayment.setStatus("REFUNDED");
             refundPayment.setPaymentType(Payment.PaymentType.CARD_REFUND.name());
+            refundPayment.setPgProvider(originalPayment.getPgProvider()); // 원본 결제의 PG사 정보 복사
             refundPayment.setResultCode((String) refundResult.get("resultCode"));
             refundPayment.setResultMsg("취소: " + refundReason);
             refundPayment.setPaymentDate(LocalDateTime.now());
@@ -1703,6 +1792,7 @@ public class PaymentService {
             // 적립금 취소 내역 Payment 테이블에 기록
             Payment pointRefund = new Payment();
             pointRefund.setOrderNo(orderNo);
+            pointRefund.setUserId(order.getUserId());
             pointRefund.setTid("POINTS_REFUND_" + System.currentTimeMillis());
             pointRefund.setAmount(-totalPointsToRefund); // 음수로 저장하여 취소 표시
             pointRefund.setStatus("REFUNDED");
@@ -1811,19 +1901,6 @@ public class PaymentService {
         }
     }
 
-    private void updatePaymentFromInicisResponse(Payment payment, InicisResponseDto response) {
-        payment.setTid(response.getTid());
-        payment.setStatus(response.isSuccess() ? "SUCCESS" : "FAILED");
-        payment.setResultCode(response.getResultCode());
-        payment.setResultMsg(response.getResultMsg());
-        payment.setCardName(response.getCardName());
-        payment.setCardCode(response.getCardCode());
-        payment.setApplNum(response.getApplNum());
-        
-        if (response.getApplDate() != null && response.getApplTime() != null) {
-            payment.setPaymentDate(paymentMapper.parsePaymentDate(response.getApplDate(), response.getApplTime()));
-        }
-    }
 
     // ===== NICE Pay 관련 메서드들 =====
 
@@ -1891,6 +1968,16 @@ public class PaymentService {
                     logger.info("=== 결제 정보 저장 시작 ===");
                     logger.info("OrderNo: {}, TID: {}, Amount: {}", orderNo, tid, amt);
 
+                    // 주문 정보 조회
+                    Optional<Order> orderOpt = orderRepository.findByOrderNo(orderNo);
+                    if (orderOpt.isEmpty()) {
+                        logger.error("주문을 찾을 수 없음: {}", orderNo);
+                        result.setSuccess(false);
+                        result.setResultMessage("주문을 찾을 수 없습니다: " + orderNo);
+                        return result;
+                    }
+                    Order order = orderOpt.get();
+
                     // 중복 결제 확인
                     Optional<Payment> existingPayment = paymentRepository.findByOrderNoAndTid(orderNo, tid);
                     if (existingPayment.isPresent()) {
@@ -1904,6 +1991,7 @@ public class PaymentService {
                     // 결제 성공 시 Payment 엔티티 저장
                     Payment payment = new Payment(
                         orderNo,
+                        order.getUserId(),
                         tid,
                         Long.valueOf(amt),
                         "COMPLETED",
@@ -1930,6 +2018,12 @@ public class PaymentService {
                     result.setAmount(Long.valueOf(amt));
 
                     logger.info("=== NICE Pay payment completed for order: {} ===", orderNo);
+
+                    // 망취소 테스트 자동 실행 비활성화 (수동 망취소 버튼으로 대체)
+                    // if (orderNo != null && orderNo.contains("NETCANCEL")) {
+                    //     logger.info("=== 나이스페이 망취소 테스트 감지 - 자동 망취소 실행 ===");
+                    //     ... 망취소 로직 ...
+                    // }
                 } catch (Exception e) {
                     logger.error("=== Error saving NICE Pay payment ===", e);
                     logger.error("OrderNo: {}, TID: {}, Amount: {}", orderNo, tid, amt);
@@ -1959,48 +2053,132 @@ public class PaymentService {
 
     // NICE Pay 취소 요청
     @Transactional
-    public Map<String, Object> cancelNicePayment(String tid, Long amount, String reason) {
+    public Map<String, Object> cancelNicePayment(String tid, Long amount, String reason, String orderNo) {
         Map<String, Object> result = new HashMap<>();
 
         try {
-            // 취소 요청 데이터 생성
-            Map<String, Object> cancelData = new HashMap<>();
-            cancelData.put("TID", tid);
-            cancelData.put("MID", nicePayMerchantId);
-            cancelData.put("Moid", tid); // 취소는 TID 기준
-            cancelData.put("CancelAmt", amount);
-            cancelData.put("CancelMsg", reason);
-            cancelData.put("CancelPwd", nicePayCancelPwd);
-            cancelData.put("PartialCancelCode", "0"); // 전체취소
+            logger.info("NicePay 취소 요청 - TID: {}, Amount: {}, Reason: {}", tid, amount, reason);
 
-            // API 호출
-            String cancelUrl = nicePayApiUrl + "payment/webpay/cancel_form.jsp";
-            HttpHeaders headers = new HttpHeaders();
-            headers.setContentType(MediaType.APPLICATION_FORM_URLENCODED);
+            // 취소 요청 파라미터 생성
+            Map<String, String> cancelParams = new HashMap<>();
+            cancelParams.put("TID", tid);
+            cancelParams.put("MID", nicePayMerchantId);
+            cancelParams.put("Moid", orderNo); // 주문번호 (우리쪽 주문번호)
+            cancelParams.put("CancelAmt", amount.toString());
 
-            MultiValueMap<String, String> formData = new LinkedMultiValueMap<>();
-            for (Map.Entry<String, Object> entry : cancelData.entrySet()) {
-                formData.add(entry.getKey(), entry.getValue().toString());
+            // CancelMsg를 euc-kr로 인코딩
+            try {
+                String encodedCancelMsg = new String(reason.getBytes("euc-kr"), "euc-kr");
+                cancelParams.put("CancelMsg", encodedCancelMsg);
+                logger.info("CancelMsg 인코딩 완료: {} -> {}", reason, encodedCancelMsg);
+            } catch (Exception e) {
+                logger.warn("CancelMsg 인코딩 실패, 원본 사용: {}", reason);
+                cancelParams.put("CancelMsg", reason);
             }
 
-            HttpEntity<MultiValueMap<String, String>> request = new HttpEntity<>(formData, headers);
-            ResponseEntity<String> response = restTemplate.postForEntity(cancelUrl, request, String.class);
+            cancelParams.put("PartialCancelCode", "0"); // 0: 전체취소, 1: 부분취소
+            cancelParams.put("EdiDate", LocalDateTime.now().format(DateTimeFormatter.ofPattern("yyyyMMddHHmmss")));
+            cancelParams.put("CharSet", "utf-8"); // 한글 메시지 때문에 euc-kr로 변경
+            cancelParams.put("EdiType", "KV"); // Key=Value 형식
+
+            // 파라미터 디버깅
+            logger.info("=== NicePay 취소 요청 파라미터 ===");
+            for (Map.Entry<String, String> entry : cancelParams.entrySet()) {
+                logger.info("{}: {}", entry.getKey(), entry.getValue());
+            }
+            logger.info("=== 파라미터 출력 완료 ===");
+
+            // 전자서명 생성 (TID + MID + CancelAmt + EdiDate + MerchantKey)
+            String signData = generateNicePayCancelSignature(cancelParams);
+            cancelParams.put("SignData", signData);
+
+            // 실제 NicePay 취소 API URL
+            String cancelUrl = "https://pg-api.nicepay.co.kr/webapi/cancel_process.jsp";
+            logger.info("NicePay 취소 URL: {}", cancelUrl);
+
+            // HTTP 호출
+            String cancelResponse = callHttpPost(cancelUrl, cancelParams);
+
+            // 응답 파싱
+            Map<String, String> responseMap = parseNicePayResponse(cancelResponse);
 
             // 로그 생성
-            createPaymentProviderLog(tid, "NICEPAY_CANCEL", cancelUrl, cancelData, "NICEPAY");
+            createPaymentProviderLog(tid, "NICEPAY_CANCEL_REQUEST", cancelUrl, new HashMap<>(cancelParams), "NICEPAY");
+            createPaymentProviderLog(tid, "NICEPAY_CANCEL_RESPONSE", cancelUrl, new HashMap<>(responseMap), "NICEPAY");
 
-            result.put("success", true);
-            result.put("response", response.getBody());
+            String resultCode = responseMap.get("ResultCode");
+            String resultMsg = responseMap.get("ResultMsg");
 
-            logger.info("NICE Pay cancellation requested for TID: {}", tid);
+            // NicePay 취소 성공 코드 확인
+            boolean isCancelSuccess = "2001".equals(resultCode) ||  // 신용카드 취소 성공
+                                     "2211".equals(resultCode) ||  // 계좌이체 취소 성공
+                                     "2221".equals(resultCode);    // 가상계좌 취소 성공
+
+            if (isCancelSuccess) {
+                result.put("success", true);
+                result.put("resultCode", resultCode);
+                result.put("resultMessage", resultMsg);
+                result.put("tid", tid);
+                result.put("cancelAmount", amount);
+                result.put("cancelDate", LocalDateTime.now().format(DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss")));
+
+                logger.info("NicePay 취소 성공 - TID: {}, ResultCode: {}", tid, resultCode);
+            } else {
+                result.put("success", false);
+                result.put("resultCode", resultCode);
+                result.put("resultMessage", resultMsg);
+
+                logger.error("NicePay 취소 실패 - TID: {}, ResultCode: {}, ResultMsg: {}", tid, resultCode, resultMsg);
+            }
 
         } catch (Exception e) {
-            logger.error("Error cancelling NICE Pay: {}", e.getMessage(), e);
+            logger.error("NicePay 취소 호출 중 오류 발생 - TID: {}", tid, e);
             result.put("success", false);
             result.put("error", e.getMessage());
         }
 
         return result;
+    }
+
+    // TID를 통해 NicePay 거래인지 판단
+
+    // NicePay 취소 전자서명 생성
+    private String generateNicePayCancelSignature(Map<String, String> params) {
+        // NicePay 취소 전자서명 (파이썬 예시 기준): MID + CancelAmt + EdiDate + MerchantKey
+        StringBuilder signData = new StringBuilder();
+        signData.append(params.get("MID"));
+        signData.append(params.get("CancelAmt"));
+        signData.append(params.get("EdiDate"));
+        signData.append(nicePayMerchantKey);
+
+        logger.info("=== NicePay 취소 전자서명 생성 ===");
+        logger.info("TID: {}", params.get("TID"));
+        logger.info("MID: {}", params.get("MID"));
+        logger.info("CancelAmt: {}", params.get("CancelAmt"));
+        logger.info("EdiDate: {}", params.get("EdiDate"));
+        logger.info("MerchantKey: {}", nicePayMerchantKey);
+        logger.info("SignData 원문: {}", signData.toString());
+
+        try {
+            MessageDigest md = MessageDigest.getInstance("SHA-256");
+            byte[] hash = md.digest(signData.toString().getBytes("euc-kr"));
+
+            StringBuilder hexString = new StringBuilder();
+            for (byte b : hash) {
+                String hex = Integer.toHexString(0xff & b);
+                if (hex.length() == 1) {
+                    hexString.append('0');
+                }
+                hexString.append(hex);
+            }
+            String signature = hexString.toString();
+            logger.info("생성된 전자서명: {}", signature);
+            logger.info("=== 전자서명 생성 완료 ===");
+            return signature;
+        } catch (Exception e) {
+            logger.error("취소 전자서명 생성 중 오류", e);
+            return "";
+        }
     }
 
     // NICE Pay 요청 데이터 생성
@@ -2039,6 +2217,8 @@ public class PaymentService {
         payment.setCardName((String) response.get("CardName"));
         payment.setCardCode((String) response.get("CardCode"));
         payment.setApplNum((String) response.get("AuthCode"));
+
+        // netCancelUrl은 인증 응답에서만 제공되므로 여기서는 처리하지 않음
 
         // NICE Pay 결제일시 설정
         String authDate = (String) response.get("AuthDate");
@@ -2204,6 +2384,10 @@ public class PaymentService {
             String nextAppURL = getStringParam(authParams, "NextAppURL");
             String netCancelURL = getStringParam(authParams, "NetCancelURL");
 
+            // NetCancelURL 디버깅 로그 추가
+            logger.info("NicePay 인증 응답에서 NetCancelURL 확인: {}", netCancelURL);
+            logger.info("NicePay 인증 응답 전체 파라미터: {}", authParams.keySet());
+
             if (authToken == null || txTid == null) {
                 throw new RuntimeException("필수 인증 정보가 없습니다. AuthToken: " + authToken + ", TxTid: " + txTid);
             }
@@ -2228,15 +2412,22 @@ public class PaymentService {
             IfInisisLog log = createPaymentProviderLog(orderNo, "NICEPAY_APPROVAL_REQUEST",
                                                      "APPROVAL_API", authParams, "NICEPAY");
 
-            // TODO: 실제 NICE Pay NextAppURL 호출
-            // 현재는 성공으로 시뮬레이션 (인증 응답 파라미터 전체 전달)
-            Map<String, Object> approvalResult = simulateNicePayApproval(authParams, orderNo);
+            // NICE Pay 승인 API 호출
+            Map<String, Object> approvalResult = callNicePayApproval(authParams, orderNo);
 
             // 승인 결과 로깅
             createPaymentProviderLog(orderNo, "NICEPAY_APPROVAL_RESPONSE",
                                    "APPROVAL_API", approvalResult, "NICEPAY");
 
-            // 결제 정보 저장
+            // 망취소 테스트 자동 실행 비활성화 (수동 망취소 버튼으로 대체)
+            // if (orderNo != null && orderNo.contains("NETCANCEL")) {
+            //     logger.info("=== NicePay 망취소 테스트 감지 - 결제 저장 없이 바로 망취소 실행 ===");
+            //     ... 망취소 로직 ...
+            //     return approvalResult;
+            // }
+
+            // 일반 결제인 경우에만 결제 정보 저장
+            approvalResult.put("netCancelURL", netCancelURL);
             saveNicePayPaymentResult(orderNo, approvalResult);
 
             return approvalResult;
@@ -2287,30 +2478,234 @@ public class PaymentService {
         }
     }
 
-    // NICE Pay 승인 시뮬레이션 (실제 구현시 NextAppURL 호출로 대체)
-    private Map<String, Object> simulateNicePayApproval(Map<String, Object> authParams, String orderNo) {
+    // NICE Pay 실제 승인 호출
+    private Map<String, Object> callNicePayApproval(Map<String, Object> authParams, String orderNo) {
         String authToken = getStringParam(authParams, "AuthToken");
         String txTid = getStringParam(authParams, "TxTid");
         String nextAppURL = getStringParam(authParams, "NextAppURL");
         String amount = getStringParam(authParams, "Amt");
 
-        logger.info("NicePay 승인 시뮬레이션 - OrderNo: {}, Amount: {}, TxTid: {}", orderNo, amount, txTid);
+        logger.info("NicePay 실제 승인 호출 - OrderNo: {}, Amount: {}, TxTid: {}", orderNo, amount, txTid);
 
-        // 실제로는 NextAppURL을 호출하여 최종 승인을 받아야 함
-        // 현재는 성공으로 시뮬레이션
         Map<String, Object> result = new HashMap<>();
-        result.put("success", true);
-        result.put("resultCode", "0000");
-        result.put("resultMessage", "정상처리");
-        result.put("orderNo", orderNo);
-        result.put("amount", amount != null ? amount : "0");
-        result.put("tid", txTid != null ? txTid : "NICE" + System.currentTimeMillis());
-        result.put("authToken", authToken);
-        result.put("nextAppURL", nextAppURL);
+
+        try {
+            if (nextAppURL == null || nextAppURL.isEmpty()) {
+                logger.error("NextAppURL이 없습니다.");
+                result.put("success", false);
+                result.put("resultCode", "9999");
+                result.put("resultMessage", "NextAppURL이 없습니다.");
+                return result;
+            }
+
+            // NextAppURL 호출을 위한 파라미터 구성
+            Map<String, String> approvalParams = new HashMap<>();
+            approvalParams.put("TID", txTid);
+            approvalParams.put("AuthToken", authToken);
+            approvalParams.put("MID", nicePayMerchantId);
+            approvalParams.put("Amt", amount);
+            approvalParams.put("EdiDate", LocalDateTime.now().format(DateTimeFormatter.ofPattern("yyyyMMddHHmmss")));
+            approvalParams.put("CharSet", "euc-kr");
+            approvalParams.put("SignData", generateNicePaySignature(approvalParams));
+
+            // HTTP 클라이언트를 사용하여 NextAppURL 호출
+            String approvalResponse = callHttpPost(nextAppURL, approvalParams);
+            // 응답 파싱
+            Map<String, String> responseMap = parseNicePayResponse(approvalResponse);
+            logger.info("NicePay 승인 성공 - responseMap: {}", responseMap);
+            String resultCode = responseMap.get("ResultCode");
+            String resultMsg = responseMap.get("ResultMsg");
+
+            // NicePay 성공 코드 확인 (결제 수단별로 다름)
+            boolean isSuccess = "3001".equals(resultCode) ||  // 신용카드 성공
+                               "4000".equals(resultCode) ||   // 계좌이체 성공
+                               "4100".equals(resultCode) ||   // 가상계좌 발급 성공
+                               "A000".equals(resultCode) ||   // 휴대폰 소액결제 성공
+                               "7001".equals(resultCode);     // 현금영수증 성공
+
+            if (isSuccess) {
+                result.put("success", true);
+                result.put("resultCode", resultCode);
+                result.put("resultMessage", resultMsg);
+                result.put("orderNo", orderNo);
+                result.put("amount", amount);
+                result.put("tid", responseMap.get("TID"));
+                result.put("authToken", authToken);
+                result.put("nextAppURL", nextAppURL);
+                result.put("authDate", responseMap.get("AuthDate"));
+                result.put("authCode", responseMap.get("AuthCode"));
+                result.put("approvedAt", LocalDateTime.now().format(DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss")));
+
+                logger.info("NicePay 승인 성공 - TID: {}, AuthCode: {}", responseMap.get("TID"), responseMap.get("AuthCode"));
+            } else {
+                result.put("success", false);
+                result.put("resultCode", resultCode);
+                result.put("resultMessage", resultMsg);
+
+                logger.error("NicePay 승인 실패 - ResultCode: {}, ResultMsg: {}", resultCode, resultMsg);
+            }
+
+        } catch (Exception e) {
+            logger.error("NicePay 승인 호출 중 오류 발생", e);
+            result.put("success", false);
+            result.put("resultCode", "9999");
+            result.put("resultMessage", "승인 호출 중 오류 발생: " + e.getMessage());
+        }
+
         result.put("authResultCode", getStringParam(authParams, "AuthResultCode"));
         result.put("authResultMsg", getStringParam(authParams, "AuthResultMsg"));
-        result.put("approvedAt", LocalDateTime.now().format(DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss")));
+
         return result;
+    }
+
+    // HTTP POST 호출 메서드
+    private String callHttpPost(String url, Map<String, String> params) throws Exception {
+        HttpURLConnection conn = null;
+        try {
+            URL urlObj = new URL(url);
+            conn = (HttpURLConnection) urlObj.openConnection();
+            conn.setRequestMethod("POST");
+            conn.setRequestProperty("Content-Type", "application/x-www-form-urlencoded; charset=euc-kr");
+            conn.setDoOutput(true);
+            conn.setConnectTimeout(30000);
+            conn.setReadTimeout(30000);
+
+            // 파라미터를 euc-kr 인코딩하여 전송
+            StringBuilder postData = new StringBuilder();
+            for (Map.Entry<String, String> entry : params.entrySet()) {
+                if (postData.length() != 0) {
+                    postData.append('&');
+                }
+                postData.append(URLEncoder.encode(entry.getKey(), "euc-kr"));
+                postData.append('=');
+                postData.append(URLEncoder.encode(entry.getValue(), "euc-kr"));
+            }
+
+            try (OutputStream os = conn.getOutputStream()) {
+                os.write(postData.toString().getBytes("euc-kr"));
+            }
+
+            int responseCode = conn.getResponseCode();
+            StringBuilder response = new StringBuilder();
+
+            if (responseCode == HttpURLConnection.HTTP_OK) {
+                try (BufferedReader br = new BufferedReader(new InputStreamReader(conn.getInputStream(), "UTF-8"))) {
+                    String line;
+                    while ((line = br.readLine()) != null) {
+                        response.append(line);
+                    }
+                }
+            } else {
+                // 오류 응답도 읽어서 로깅
+                try (BufferedReader br = new BufferedReader(new InputStreamReader(conn.getErrorStream(), "UTF-8"))) {
+                    String line;
+                    while ((line = br.readLine()) != null) {
+                        response.append(line);
+                    }
+                } catch (Exception e) {
+                    logger.warn("오류 응답 읽기 실패", e);
+                }
+                logger.error("HTTP 오류 응답 - 코드: {}, 내용: {}", responseCode, response.toString());
+                throw new Exception("HTTP 응답 코드: " + responseCode + ", 내용: " + response.toString());
+            }
+
+            return response.toString();
+        } finally {
+            if (conn != null) {
+                conn.disconnect();
+            }
+        }
+    }
+
+    // NicePay 응답 파싱 메서드
+    private Map<String, String> parseNicePayResponse(String response) {
+        Map<String, String> result = new HashMap<>();
+        if (response == null || response.isEmpty()) {
+            logger.warn("NicePay 응답이 비어있습니다.");
+            return result;
+        }
+
+        logger.info("NicePay 원본 응답: {}", response);
+
+        try {
+            // JSON 형태 응답인지 확인
+            if (response.trim().startsWith("{")) {
+                ObjectMapper mapper = new ObjectMapper();
+                Map<String, Object> jsonMap = mapper.readValue(response, Map.class);
+                for (Map.Entry<String, Object> entry : jsonMap.entrySet()) {
+                    result.put(entry.getKey(), entry.getValue() != null ? entry.getValue().toString() : "");
+                }
+                logger.info("JSON 응답으로 파싱 완료: {}", result);
+                return result;
+            }
+
+            // key=value&key=value 형태 응답 파싱
+            String[] pairs = response.split("&");
+            for (String pair : pairs) {
+                String[] keyValue = pair.split("=", 2);
+                if (keyValue.length == 2) {
+                    try {
+                        // UTF-8로 먼저 시도
+                        String key = URLDecoder.decode(keyValue[0], "UTF-8");
+                        String value = URLDecoder.decode(keyValue[1], "UTF-8");
+                        result.put(key, value);
+                    } catch (Exception e) {
+                        // UTF-8 실패시 euc-kr로 시도
+                        try {
+                            String key = URLDecoder.decode(keyValue[0], "euc-kr");
+                            String value = URLDecoder.decode(keyValue[1], "euc-kr");
+                            result.put(key, value);
+                        } catch (Exception e2) {
+                            // 디코딩 없이 원본값 사용
+                            result.put(keyValue[0], keyValue[1]);
+                            logger.warn("URL 디코딩 실패, 원본값 사용: {}", pair);
+                        }
+                    }
+                } else if (keyValue.length == 1 && !keyValue[0].isEmpty()) {
+                    // 값이 없는 키는 빈 문자열로 설정
+                    result.put(keyValue[0], "");
+                }
+            }
+
+            logger.info("Key-Value 응답으로 파싱 완료: {}", result);
+
+        } catch (Exception e) {
+            logger.error("NicePay 응답 파싱 중 전체 오류 발생", e);
+            // 파싱 실패시 원본 응답을 ResultMsg에 저장
+            result.put("ResultCode", "9999");
+            result.put("ResultMsg", "응답 파싱 실패: " + response);
+        }
+
+        return result;
+    }
+
+    // NicePay 전자서명 생성
+    private String generateNicePaySignature(Map<String, String> params) {
+        // 필요한 파라미터들을 정렬된 순서로 연결
+        StringBuilder signData = new StringBuilder();
+        signData.append(params.get("AuthToken"));
+        signData.append(params.get("MID"));
+        signData.append(params.get("Amt"));
+        signData.append(params.get("EdiDate"));
+        signData.append(nicePayMerchantKey);
+
+        try {
+            MessageDigest md = MessageDigest.getInstance("SHA-256");
+            byte[] hash = md.digest(signData.toString().getBytes("UTF-8"));
+
+            StringBuilder hexString = new StringBuilder();
+            for (byte b : hash) {
+                String hex = Integer.toHexString(0xff & b);
+                if (hex.length() == 1) {
+                    hexString.append('0');
+                }
+                hexString.append(hex);
+            }
+            return hexString.toString();
+        } catch (Exception e) {
+            logger.error("전자서명 생성 중 오류", e);
+            return "";
+        }
     }
 
     // NICE Pay 결제 결과 저장
@@ -2334,11 +2729,31 @@ public class PaymentService {
             // Payment 엔티티 저장
             Payment payment = new Payment();
             payment.setOrderNo(orderNo);
+            payment.setUserId(order.getUserId());
             payment.setTid(tid);
             payment.setAmount(amt != null ? Long.parseLong(amt) : order.getCardAmount());
             payment.setStatus("COMPLETED");
             payment.setPaymentDate(LocalDateTime.now());
-            payment.setPaymentType("NICEPAY_CARD");
+            payment.setPaymentType(Payment.PaymentType.CARD.name());
+            payment.setPgProvider("NICEPAY");
+
+            // netCancelURL 저장 (인증 응답에서 받은 값)
+            String netCancelURL = (String) result.get("netCancelURL");
+            if (netCancelURL != null) {
+                payment.setNetCancelUrl(netCancelURL);
+                logger.info("NicePay 결제 저장 시 netCancelURL 설정: {}", netCancelURL);
+            } else {
+                logger.warn("NicePay 결제 저장 시 netCancelURL이 null입니다");
+            }
+
+            // AuthToken 저장 (망취소에 필요)
+            String authToken = (String) result.get("authToken");
+            if (authToken != null) {
+                payment.setAuthToken(authToken);
+                logger.info("NicePay 결제 저장 시 AuthToken 설정: {}", authToken);
+            } else {
+                logger.warn("NicePay 결제 저장 시 AuthToken이 null입니다");
+            }
 
             paymentRepository.save(payment);
 
@@ -2352,4 +2767,503 @@ public class PaymentService {
             logger.error("NICE Pay 결제 정보 저장 중 오류: {}", e.getMessage(), e);
         }
     }
+
+    // =================
+    // 망취소 관련 메서드
+    // =================
+
+    // 망취소 후 결제 상태 업데이트 (별도 트랜잭션)
+    @Transactional(propagation = Propagation.REQUIRES_NEW)
+    public void updatePaymentStatusAfterNetworkCancel(Long paymentId) {
+        try {
+            Optional<Payment> paymentOpt = paymentRepository.findById(paymentId);
+            if (paymentOpt.isPresent()) {
+                Payment payment = paymentOpt.get();
+                payment.setStatus("CANCELLED");
+                payment.setResultMsg(payment.getResultMsg() + " (망취소 완료)");
+                paymentRepository.save(payment);
+                logger.info("망취소 성공으로 결제 상태를 CANCELLED로 변경 - Payment ID: {}", paymentId);
+            } else {
+                logger.error("Payment not found for ID: {}", paymentId);
+            }
+        } catch (Exception e) {
+            logger.error("Error updating payment status after network cancel: {}", e.getMessage(), e);
+        }
+    }
+
+    // 망취소 기록 저장 (별도 트랜잭션)
+    @Transactional(propagation = Propagation.REQUIRES_NEW)
+    public void saveNetworkCancelRecord(Payment originalPayment, Map<String, Object> networkCancelResult, String reason) {
+        try {
+            logger.info("망취소 기록 저장 - Original Payment ID: {}", originalPayment.getId());
+
+            Payment networkCancelPayment = new Payment();
+            networkCancelPayment.setOrderNo(originalPayment.getOrderNo());
+            networkCancelPayment.setUserId(originalPayment.getUserId());
+            networkCancelPayment.setTid(originalPayment.getTid());
+            networkCancelPayment.setAmount(-originalPayment.getAmount()); // 음수로 저장하여 취소 표시
+            networkCancelPayment.setStatus("COMPLETED");
+            networkCancelPayment.setPaymentType(Payment.PaymentType.NETWORK_CANCEL.name());
+            networkCancelPayment.setPgProvider(originalPayment.getPgProvider());
+            networkCancelPayment.setResultCode("00");
+            networkCancelPayment.setResultMsg("망취소 완료 - " + reason);
+            networkCancelPayment.setCardName(originalPayment.getCardName());
+            networkCancelPayment.setPaymentDate(LocalDateTime.now());
+
+            // 망취소 관련 추가 정보 설정
+            if (networkCancelResult.get("cancelType") != null) {
+                networkCancelPayment.setResultMsg(networkCancelPayment.getResultMsg() +
+                    " (타입: " + networkCancelResult.get("cancelType") + ")");
+            }
+
+            paymentRepository.save(networkCancelPayment);
+            logger.info("망취소 기록 저장 완료 - Payment ID: {}, Amount: {}",
+                       networkCancelPayment.getId(), networkCancelPayment.getAmount());
+
+        } catch (Exception e) {
+            logger.error("망취소 기록 저장 중 오류: {}", e.getMessage(), e);
+        }
+    }
+
+    // 망취소 후 주문 상태 업데이트 (별도 트랜잭션)
+    @Transactional(propagation = Propagation.REQUIRES_NEW)
+    public void updateOrderStatusAfterNetworkCancel(String orderNo) {
+        try {
+            Optional<Order> orderOpt = orderRepository.findByOrderNo(orderNo);
+            if (orderOpt.isPresent()) {
+                Order order = orderOpt.get();
+                order.setStatus(Order.OrderStatus.NETWORK_CANCELLED);
+                orderRepository.save(order);
+                logger.info("망취소 성공으로 주문 상태를 NETWORK_CANCELLED로 변경 - Order: {}", orderNo);
+            } else {
+                logger.error("Order not found for OrderNo: {}", orderNo);
+            }
+        } catch (Exception e) {
+            logger.error("Error updating order status after network cancel: {}", e.getMessage(), e);
+        }
+    }
+
+    // 수동 망취소 실행
+    public Map<String, Object> performNetworkCancel(String orderNo, String reason, String clientIp) {
+        try {
+            logger.info("=== 수동 망취소 요청 - Order: {}, Reason: {} ===", orderNo, reason);
+
+            // 주문 정보 조회
+            Optional<Order> orderOpt = orderRepository.findByOrderNo(orderNo);
+            if (orderOpt.isEmpty()) {
+                return Map.of(
+                    "success", false,
+                    "message", "주문을 찾을 수 없습니다: " + orderNo
+                );
+            }
+
+            Order order = orderOpt.get();
+
+            // 이미 망취소된 주문인지 확인
+            if (order.getStatus() == Order.OrderStatus.NETWORK_CANCELLED) {
+                return Map.of(
+                    "success", false,
+                    "message", "이미 망취소된 주문입니다"
+                );
+            }
+
+            // 완료된 결제 내역 조회
+            List<Payment> completedPayments = paymentRepository.findByOrderNoOrderByPaymentDateDesc(orderNo)
+                .stream()
+                .filter(p -> "COMPLETED".equals(p.getStatus()) && p.getAmount() > 0)
+                .toList();
+
+            if (completedPayments.isEmpty()) {
+                return Map.of(
+                    "success", false,
+                    "message", "망취소할 수 있는 완료된 결제가 없습니다"
+                );
+            }
+
+            // 카드 결제 찾기 (망취소 대상)
+            Payment cardPayment = completedPayments.stream()
+                .filter(p -> "CARD".equals(p.getPaymentType()))
+                .findFirst()
+                .orElse(null);
+
+            if (cardPayment == null) {
+                return Map.of(
+                    "success", false,
+                    "message", "망취소할 수 있는 카드 결제가 없습니다"
+                );
+            }
+
+            // PG사별 망취소 실행
+            logger.info("=== 망취소 파라미터 확인 ===");
+            logger.info("PG사: {}", cardPayment.getPgProvider());
+            logger.info("TID: {}", cardPayment.getTid());
+            logger.info("NetCancelUrl: {}", cardPayment.getNetCancelUrl() != null ? "있음" : "없음");
+            logger.info("AuthToken: {}", cardPayment.getAuthToken() != null && !cardPayment.getAuthToken().isEmpty() ? "있음" : "없음");
+            logger.info("결제 금액: {}", cardPayment.getAmount());
+
+            Map<String, Object> networkCancelResult;
+            if ("INICIS".equals(cardPayment.getPgProvider())) {
+                // Inicis 망취소 필수 파라미터 검증
+                if (cardPayment.getNetCancelUrl() == null || cardPayment.getNetCancelUrl().trim().isEmpty()) {
+                    logger.error("Inicis 망취소 실패 - NetCancelUrl 없음");
+                    return Map.of(
+                        "success", false,
+                        "message", "Inicis 망취소에 필요한 NetCancelUrl이 없습니다"
+                    );
+                }
+                if (cardPayment.getAuthToken() == null || cardPayment.getAuthToken().trim().isEmpty()) {
+                    logger.error("Inicis 망취소 실패 - AuthToken 없음");
+                    return Map.of(
+                        "success", false,
+                        "message", "Inicis 망취소에 필요한 AuthToken이 없습니다"
+                    );
+                }
+
+                logger.info("Inicis 망취소 실행 - TID: {}, URL: {}", cardPayment.getTid(), cardPayment.getNetCancelUrl());
+                networkCancelResult = networkCancelInicisWithUrl(
+                    cardPayment.getTid(),
+                    cardPayment.getNetCancelUrl(),
+                    cardPayment.getAuthToken(),
+                    reason,
+                    clientIp
+                );
+            } else if ("NICEPAY".equals(cardPayment.getPgProvider())) {
+                // NicePay 망취소 필수 파라미터 검증
+                if (cardPayment.getAuthToken() == null || cardPayment.getAuthToken().trim().isEmpty()) {
+                    logger.error("NicePay 망취소 실패 - AuthToken 없음");
+                    return Map.of(
+                        "success", false,
+                        "message", "NicePay 망취소에 필요한 AuthToken이 없습니다"
+                    );
+                }
+
+                logger.info("NicePay 망취소 실행 - TID: {}", cardPayment.getTid());
+                networkCancelResult = networkCancelNicePay(
+                    cardPayment.getTid(),
+                    reason,
+                    orderNo
+                );
+            } else {
+                logger.error("지원하지 않는 PG사: {}", cardPayment.getPgProvider());
+                return Map.of(
+                    "success", false,
+                    "message", "지원하지 않는 PG사입니다: " + cardPayment.getPgProvider()
+                );
+            }
+
+            // 망취소 성공 시 상태 업데이트 및 기록 저장
+            if (networkCancelResult.get("success") != null &&
+                Boolean.TRUE.equals(networkCancelResult.get("success"))) {
+
+                // 1. 원본 결제 상태 업데이트
+                updatePaymentStatusAfterNetworkCancel(cardPayment.getId());
+
+                // 2. 망취소 기록 저장 (음수 금액으로 취소 표시)
+                saveNetworkCancelRecord(cardPayment, networkCancelResult, reason);
+
+                // 3. 주문 상태 업데이트
+                updateOrderStatusAfterNetworkCancel(orderNo);
+
+                logger.info("망취소 완료 처리 성공 - Order: {}, Payment ID: {}, Amount: {}",
+                           orderNo, cardPayment.getId(), cardPayment.getAmount());
+
+                return Map.of(
+                    "success", true,
+                    "message", "망취소가 성공적으로 완료되었습니다",
+                    "orderNo", orderNo,
+                    "cancelledAmount", cardPayment.getAmount(),
+                    "pgProvider", cardPayment.getPgProvider(),
+                    "networkCancelResult", networkCancelResult
+                );
+            } else {
+                logger.error("망취소 실패 - Order: {}, Result: {}", orderNo, networkCancelResult);
+                return Map.of(
+                    "success", false,
+                    "message", "망취소 실패: " + networkCancelResult.getOrDefault("resultMessage", "알 수 없는 오류"),
+                    "networkCancelResult", networkCancelResult
+                );
+            }
+
+        } catch (Exception e) {
+            logger.error("수동 망취소 처리 중 오류: {}", e.getMessage(), e);
+            return Map.of(
+                "success", false,
+                "message", "망취소 처리 중 오류가 발생했습니다: " + e.getMessage()
+            );
+        }
+    }
+
+    // 이니시스 망취소
+
+    // 이니시스 망취소 (URL 직접 지정)
+    public Map<String, Object> networkCancelInicisWithUrl(String tid, String netCancelUrl, String authToken, String reason, String clientIp) {
+        Map<String, Object> result = new HashMap<>();
+
+        try {
+            logger.info("이니시스 망취소 요청 (URL 직접 지정) - TID: {}, URL: {}, AuthToken: {}, Reason: {}", tid, netCancelUrl, authToken, reason);
+
+            // 망취소 요청 파라미터 생성 (이니시스 망취소 API 표준 파라미터)
+            Map<String, String> requestParams = new HashMap<>();
+            requestParams.put("mid", inicisMerchantId);
+            requestParams.put("authToken", authToken);
+            requestParams.put("timestamp", String.valueOf(System.currentTimeMillis() / 1000));
+            requestParams.put("charset", "UTF-8");
+            requestParams.put("format", "JSON");
+
+            // signature 생성: authToken=authTokenValue&timestamp=timestampValue
+            String signatureNVP = "authToken=" + authToken + "&timestamp=" + requestParams.get("timestamp");
+            String signature = sha256Hash(signatureNVP);
+            requestParams.put("signature", signature);
+
+            // verification 생성: authToken=authTokenValue&signKey=signKeyValue&timestamp=timestampValue
+            String verificationNVP = "authToken=" + authToken + "&signKey=" + inicisSignKey + "&timestamp=" + requestParams.get("timestamp");
+            String verification = sha256Hash(verificationNVP);
+            requestParams.put("verification", verification);
+
+            logger.info("=== 이니시스 망취소 요청 파라미터 (URL 직접 지정) ===");
+            for (Map.Entry<String, String> entry : requestParams.entrySet()) {
+                if (!"signature".equals(entry.getKey()) && !"verification".equals(entry.getKey()) && !"authToken".equals(entry.getKey())) {
+                    logger.info("{}: {}", entry.getKey(), entry.getValue());
+                }
+            }
+            logger.info("signature: {}", signature);
+            logger.info("verification: {}", verification);
+            logger.info("authToken: ***");
+            logger.info("signature NVP: {}", signatureNVP);
+            logger.info("verification NVP: authToken=***&signKey=***&timestamp={}", requestParams.get("timestamp"));
+            logger.info("사용할 URL: {}", netCancelUrl);
+
+            // API 호출
+            String response = callHttpPost(netCancelUrl, requestParams);
+
+            // 응답 파싱
+            Map<String, String> responseMap = parseInicisRefundResponse(response);
+
+            String resultCode = responseMap.get("resultCode");
+            String resultMsg = responseMap.get("resultMsg");
+
+            // 로그 생성
+            createPaymentProviderLog(tid, "INICIS_NETWORK_CANCEL_REQUEST_WITH_URL", netCancelUrl, new HashMap<>(requestParams), "INICIS");
+            createPaymentProviderLog(tid, "INICIS_NETWORK_CANCEL_RESPONSE_WITH_URL", netCancelUrl, new HashMap<>(responseMap), "INICIS");
+
+            if ("0000".equals(resultCode)) {
+                result.put("success", true);
+                result.put("resultCode", resultCode);
+                result.put("resultMessage", resultMsg);
+                result.put("tid", tid);
+                result.put("cancelType", "NETWORK_CANCEL");
+                result.put("cancelDate", LocalDateTime.now().format(DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss")));
+
+                logger.info("이니시스 망취소 성공 (URL 직접 지정) - TID: {}", tid);
+            } else {
+                result.put("success", false);
+                result.put("resultCode", resultCode);
+                result.put("resultMessage", resultMsg);
+
+                logger.error("이니시스 망취소 실패 (URL 직접 지정) - TID: {}, Code: {}, Msg: {}", tid, resultCode, resultMsg);
+            }
+
+        } catch (Exception e) {
+            logger.error("이니시스 망취소 호출 중 오류 발생 (URL 직접 지정) - TID: {}", tid, e);
+            result.put("success", false);
+            result.put("error", e.getMessage());
+        }
+
+        return result;
+    }
+
+    // 나이스페이 망취소
+    @Transactional
+    public Map<String, Object> networkCancelNicePay(String tid, String reason, String orderNo) {
+        Map<String, Object> result = new HashMap<>();
+
+        try {
+            logger.info("나이스페이 망취소 요청 - TID: {}, OrderNo: {}, Reason: {}", tid, orderNo, reason);
+
+            // 결제 정보에서 망취소 URL 조회
+            Optional<Payment> paymentOpt = paymentRepository.findByTid(tid);
+            String netCancelUrl = null;
+
+            if (paymentOpt.isPresent() && paymentOpt.get().getNetCancelUrl() != null) {
+                netCancelUrl = paymentOpt.get().getNetCancelUrl();
+                logger.info("저장된 나이스페이 망취소 URL 사용: {}", netCancelUrl);
+            } else {
+                // 기본 취소 URL 사용 (망취소 URL이 없는 경우)
+                netCancelUrl = "https://pg-api.nicepay.co.kr/webapi/cancel_process.jsp";
+                logger.warn("망취소 전용 URL이 없어 기본 취소 URL 사용: {}", netCancelUrl);
+            }
+
+            // 결제 정보에서 AuthToken 및 금액 조회
+            String authToken = null;
+            String paymentAmount = "0";
+
+            if (paymentOpt.isPresent()) {
+                Payment payment = paymentOpt.get();
+                paymentAmount = String.valueOf(payment.getAmount());
+                logger.info("결제 금액 조회: {}", paymentAmount);
+
+                // 실제 저장된 AuthToken 사용
+                authToken = payment.getAuthToken();
+                logger.info("NicePay 망취소 - 결제 정보에서 AuthToken 추출: {}",
+                           authToken != null && !authToken.isEmpty() ? "있음" : "없음");
+
+                if (authToken == null || authToken.trim().isEmpty()) {
+                    logger.warn("NicePay 망취소 - AuthToken이 없습니다. TID: {}", tid);
+                    return Map.of(
+                        "success", false,
+                        "message", "NicePay 망취소에 필요한 AuthToken이 없습니다"
+                    );
+                }
+            }
+
+            // 망취소 요청 파라미터 생성 (NicePay 망취소 필수 파라미터 포함)
+            String ediDate = LocalDateTime.now().format(DateTimeFormatter.ofPattern("yyyyMMddHHmmss"));
+
+            Map<String, String> cancelParams = new HashMap<>();
+            cancelParams.put("TID", tid);                    // 필수
+            cancelParams.put("AuthToken", authToken != null ? authToken : "");  // 필수 (40 byte)
+            cancelParams.put("MID", nicePayMerchantId);      // 필수 (10 byte)
+            cancelParams.put("Amt", paymentAmount);          // 필수 (12 byte) - 망취소도 원래 금액 필요
+            cancelParams.put("EdiDate", ediDate);            // 필수 (14 byte)
+            cancelParams.put("NetCancel", "1");             // 필수 (1 byte) - 망취소 구분자
+
+            // 선택적 파라미터
+            cancelParams.put("Moid", orderNo != null ? orderNo : "");
+            cancelParams.put("CharSet", "utf-8");           // 10 byte
+            cancelParams.put("EdiType", "JSON");            // 10 byte - JSON 응답으로 변경
+
+            // CancelMsg 인코딩
+            try {
+                String encodedCancelMsg = new String((reason + " (망취소)").getBytes("utf-8"), "utf-8");
+                cancelParams.put("CancelMsg", encodedCancelMsg);
+            } catch (Exception e) {
+                cancelParams.put("CancelMsg", reason + " (망취소)");
+            }
+
+            cancelParams.put("PartialCancelCode", "0");     // 전체취소
+
+            logger.info("=== 나이스페이 망취소 요청 파라미터 ===");
+            for (Map.Entry<String, String> entry : cancelParams.entrySet()) {
+                logger.info("{}: {}", entry.getKey(), entry.getValue());
+            }
+            logger.info("사용할 URL: {}", netCancelUrl);
+
+            // 전자서명 생성 (망취소용: AuthToken + MID + Amt + EdiDate + MerchantKey)
+            String signDataSource = (authToken != null ? authToken : "") +
+                                   nicePayMerchantId +
+                                   paymentAmount +
+                                   ediDate +
+                                   nicePayMerchantKey;
+            String signData = sha256Hash(signDataSource);
+            cancelParams.put("SignData", signData);
+
+            logger.info("=== NicePay 망취소 서명 생성 ===");
+            logger.info("서명 원본: AuthToken={}, MID={}, Amt={}, EdiDate={}, MerchantKey=***",
+                       (authToken != null ? authToken : ""), nicePayMerchantId, paymentAmount, ediDate);
+            logger.info("서명 결과: {}", signData);
+
+            logger.info("=== NicePay 망취소 API 호출 시작 ===");
+            logger.info("요청 URL: {}", netCancelUrl);
+            logger.info("요청 파라미터 개수: {}", cancelParams.size());
+
+            // API 호출
+            String cancelResponse = callHttpPost(netCancelUrl, cancelParams);
+
+            logger.info("=== NicePay 망취소 API 응답 ===");
+            logger.info("응답 길이: {} bytes", cancelResponse != null ? cancelResponse.length() : 0);
+            logger.info("원본 응답: {}", cancelResponse);
+
+            // 응답 파싱
+            Map<String, String> responseMap = parseNicePayResponse(cancelResponse);
+            logger.info("파싱된 응답: {}", responseMap);
+
+            // 로그 생성
+            createPaymentProviderLog(tid, "NICEPAY_NETWORK_CANCEL_REQUEST", netCancelUrl, new HashMap<>(cancelParams), "NICEPAY");
+            createPaymentProviderLog(tid, "NICEPAY_NETWORK_CANCEL_RESPONSE", netCancelUrl, new HashMap<>(responseMap), "NICEPAY");
+
+            String resultCode = responseMap.get("ResultCode");
+            String resultMsg = responseMap.get("ResultMsg");
+
+            // 나이스페이 망취소 성공 코드 확인
+            boolean isCancelSuccess = "2001".equals(resultCode) ||  // 신용카드 취소 성공
+                                     "2211".equals(resultCode) ||  // 계좌이체 취소 성공
+                                     "2221".equals(resultCode);    // 가상계좌 취소 성공
+
+            if (isCancelSuccess) {
+                result.put("success", true);
+                result.put("resultCode", resultCode);
+                result.put("resultMessage", resultMsg);
+                result.put("tid", tid);
+                result.put("cancelType", "NETWORK_CANCEL");
+                result.put("cancelDate", LocalDateTime.now().format(DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss")));
+
+                logger.info("나이스페이 망취소 성공 - TID: {}, ResultCode: {}", tid, resultCode);
+            } else {
+                result.put("success", false);
+                result.put("resultCode", resultCode);
+                result.put("resultMessage", resultMsg);
+
+                logger.error("나이스페이 망취소 실패 - TID: {}, ResultCode: {}, ResultMsg: {}", tid, resultCode, resultMsg);
+            }
+
+        } catch (Exception e) {
+            logger.error("나이스페이 망취소 호출 중 오류 발생 - TID: {}", tid, e);
+            result.put("success", false);
+            result.put("error", e.getMessage());
+        }
+
+        return result;
+    }
+
+
+    // 이니시스 환불/망취소 응답 파싱
+    private Map<String, String> parseInicisRefundResponse(String response) {
+        Map<String, String> result = new HashMap<>();
+        if (response == null || response.isEmpty()) {
+            logger.warn("이니시스 환불 응답이 비어있습니다.");
+            return result;
+        }
+
+        logger.info("이니시스 환불 원본 응답: {}", response);
+
+        try {
+            // JSON 형태 응답 파싱 (이니시스는 주로 JSON으로 응답)
+            if (response.trim().startsWith("{")) {
+                ObjectMapper mapper = new ObjectMapper();
+                Map<String, Object> jsonMap = mapper.readValue(response, Map.class);
+                for (Map.Entry<String, Object> entry : jsonMap.entrySet()) {
+                    result.put(entry.getKey(), entry.getValue() != null ? entry.getValue().toString() : "");
+                }
+                logger.info("이니시스 환불 JSON 응답 파싱 완료: {}", result);
+                return result;
+            }
+
+            // key=value&key=value 형태 응답 파싱 (혹시 다른 형태로 올 경우)
+            String[] pairs = response.split("&");
+            for (String pair : pairs) {
+                String[] keyValue = pair.split("=", 2);
+                if (keyValue.length == 2) {
+                    try {
+                        String key = URLDecoder.decode(keyValue[0], "UTF-8");
+                        String value = URLDecoder.decode(keyValue[1], "UTF-8");
+                        result.put(key, value);
+                    } catch (Exception e) {
+                        logger.warn("이니시스 환불 응답 파싱 중 URL 디코딩 실패: {}", pair);
+                        result.put(keyValue[0], keyValue[1]);
+                    }
+                }
+            }
+
+            logger.info("이니시스 환불 key=value 응답 파싱 완료: {}", result);
+
+        } catch (Exception e) {
+            logger.error("이니시스 환불 응답 파싱 실패: {}", e.getMessage(), e);
+            // 파싱 실패 시 원본 응답을 error 키에 저장
+            result.put("error", "응답 파싱 실패");
+            result.put("originalResponse", response);
+        }
+
+        return result;
+    }
+
 }

@@ -37,7 +37,7 @@ public class Order {
     private LocalDateTime updatedAt;
     
     public enum OrderStatus {
-        PENDING, PENDING_APPROVAL, APPROVED, COMPLETED, CANCELLED, FAILED
+        PENDING, PENDING_APPROVAL, APPROVED, COMPLETED, CANCELLED, FAILED, NETWORK_CANCELLED
     }
     
     @PrePersist

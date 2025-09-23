@@ -13,7 +13,10 @@ public class Payment {
     
     @Column(name = "order_no", nullable = false)
     private String orderNo;
-    
+
+    @Column(name = "user_id")
+    private Long userId;
+
     @Column(name = "tid")
     private String tid;
     
@@ -50,6 +53,15 @@ public class Payment {
     @Column(name = "payment_type", nullable = false)
     private String paymentType; // CARD, POINT, CARD_REFUND, POINT_REFUND
 
+    @Column(name = "pg_provider")
+    private String pgProvider; // INICIS, NICEPAY
+
+    @Column(name = "net_cancel_url")
+    private String netCancelUrl; // 망취소 전용 URL (이니시스: netCancelUrl, 나이스페이: NetCancelURL)
+
+    @Column(name = "auth_token")
+    private String authToken; // 인증 토큰 (NicePay 망취소 시 필요)
+
     public enum PaymentStatus {
         PENDING,
         COMPLETED,
@@ -62,7 +74,8 @@ public class Payment {
         CARD("카드결제"),
         POINT("적립금"),
         CARD_REFUND("카드취소"),
-        POINT_REFUND("적립금취소");
+        POINT_REFUND("적립금취소"),
+        NETWORK_CANCEL("망취소");
 
         private final String description;
 
@@ -88,6 +101,23 @@ public class Payment {
     
     public Payment() {}
     
+    public Payment(String orderNo, Long userId, String tid, Long amount, String status, String resultCode, String resultMsg, String paymentType) {
+        this.orderNo = orderNo;
+        this.userId = userId;
+        this.tid = tid;
+        this.amount = amount;
+        this.status = status;
+        this.resultCode = resultCode;
+        this.resultMsg = resultMsg;
+        this.paymentType = paymentType;
+        this.paymentDate = LocalDateTime.now();
+    }
+
+    public Payment(String orderNo, Long userId, String tid, Long amount, String status, String resultCode, String resultMsg) {
+        this(orderNo, userId, tid, amount, status, resultCode, resultMsg, PaymentType.CARD.name());
+    }
+
+    // 기존 생성자 호환성 유지
     public Payment(String orderNo, String tid, Long amount, String status, String resultCode, String resultMsg, String paymentType) {
         this.orderNo = orderNo;
         this.tid = tid;
@@ -108,6 +138,9 @@ public class Payment {
     
     public String getOrderNo() { return orderNo; }
     public void setOrderNo(String orderNo) { this.orderNo = orderNo; }
+
+    public Long getUserId() { return userId; }
+    public void setUserId(Long userId) { this.userId = userId; }
     
     public String getTid() { return tid; }
     public void setTid(String tid) { this.tid = tid; }
@@ -152,4 +185,13 @@ public class Payment {
 
     public String getPaymentType() { return paymentType; }
     public void setPaymentType(String paymentType) { this.paymentType = paymentType; }
+
+    public String getPgProvider() { return pgProvider; }
+    public void setPgProvider(String pgProvider) { this.pgProvider = pgProvider; }
+
+    public String getNetCancelUrl() { return netCancelUrl; }
+    public void setNetCancelUrl(String netCancelUrl) { this.netCancelUrl = netCancelUrl; }
+
+    public String getAuthToken() { return authToken; }
+    public void setAuthToken(String authToken) { this.authToken = authToken; }
 }

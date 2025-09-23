@@ -37,11 +37,8 @@ public interface PaymentRepository extends JpaRepository<Payment, Long> {
 
     boolean existsByOrderNo(String orderNo);
     
-    // 사용자별 결제 내역 조회 (Order 테이블과 조인)
-    @Query("SELECT p FROM Payment p " +
-           "JOIN Order o ON p.orderNo = o.orderNo " +
-           "WHERE o.userId = :userId " +
-           "ORDER BY p.paymentDate DESC")
+    // 사용자별 결제 내역 조회 (Payment 테이블 직접 조회)
+    @Query("SELECT p FROM Payment p WHERE p.userId = :userId ORDER BY p.paymentDate DESC")
     List<Payment> findByUserIdOrderByPaymentDateDesc(@Param("userId") Long userId);
     
     // TID와 상태로 가장 최신 결제 내역 조회 (취소용)
