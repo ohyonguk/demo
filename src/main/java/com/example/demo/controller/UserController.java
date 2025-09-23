@@ -8,6 +8,14 @@ import org.springframework.web.bind.annotation.*;
 
 import jakarta.validation.Valid;
 
+/**
+ * 사용자 관리 API를 처리하는 컨트롤러
+ *
+ * 사용자 등록, 조회, 수정, 삭제 등의 기능을 제공합니다.
+ *
+ * @author Generated with Claude Code
+ * @version 1.0
+ */
 @RestController
 @RequestMapping("/api/users")
 @CrossOrigin(origins = {"http://localhost:3000", "http://127.0.0.1:3000"}, allowCredentials = "true")
@@ -16,6 +24,14 @@ public class UserController {
     @Autowired
     private UserRepository userRepository;
 
+    /**
+     * 새로운 사용자 등록
+     *
+     * 이메일 중복 체크를 수행한 후 사용자를 등록합니다.
+     *
+     * @param user 등록할 사용자 정보
+     * @return 등록된 사용자 정보 또는 오류 응답
+     */
     @PostMapping
     public ResponseEntity<User> createUser(@Valid @RequestBody User user) {
         if (userRepository.existsByEmail(user.getEmail())) {

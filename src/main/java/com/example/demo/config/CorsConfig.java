@@ -20,7 +20,7 @@ public class CorsConfig {
         return new WebMvcConfigurer() {
             @Override
             public void addCorsMappings(CorsRegistry registry) {
-                // 모든 허용된 도메인을 합쳐서 설정
+                // 21: 서버의 CORS 는 FO 도메인과 PG 사 도메인만을 허용합니다.
                 String[] allAllowedOrigins = combineOrigins(allowedOrigins, allowedPgDomains);
 
                 registry.addMapping("/**")
@@ -33,6 +33,16 @@ public class CorsConfig {
         };
     }
 
+    /**
+     * 21: 서버의 CORS 는 FO 도메인과 PG 사 도메인만을 허용합니다.
+     *
+     * FO(Front-Office) 도메인과 PG(Payment Gateway) 도메인을 결합하여
+     * CORS 허용 도메인 목록을 생성합니다.
+     *
+     * @param foOrigins FO 도메인 배열 (프론트엔드 도메인)
+     * @param pgOrigins PG 도메인 배열 (결제 게이트웨이 도메인)
+     * @return 결합된 허용 도메인 배열
+     */
     private String[] combineOrigins(String[] foOrigins, String[] pgOrigins) {
         String[] combined = new String[foOrigins.length + pgOrigins.length];
         System.arraycopy(foOrigins, 0, combined, 0, foOrigins.length);

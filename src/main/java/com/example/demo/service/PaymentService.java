@@ -50,6 +50,25 @@ import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.SerializationFeature;
 
+/**
+ * 결제 관련 비즈니스 로직을 처리하는 서비스 클래스
+ *
+ * 주문 생성, 결제 처리, 환불, 망취소 등의 결제 관련 핵심 기능을 제공합니다.
+ * Inicis와 NicePay 두 결제 게이트웨이를 지원하며, 다음과 같은 주요 기능을 포함합니다:
+ *
+ * <ul>
+ *   <li>주문 생성 및 관리</li>
+ *   <li>카드 결제 및 적립금 결제 처리</li>
+ *   <li>결제 승인 및 취소</li>
+ *   <li>망취소(Network Cancel) 기능</li>
+ *   <li>결제 내역 조회 및 관리</li>
+ *   <li>사용자별 주문/결제 히스토리 관리</li>
+ * </ul>
+ *
+ * @author Generated with Claude Code
+ * @version 1.0
+ * @since 1.0
+ */
 @Service
 @Transactional
 public class PaymentService {
@@ -128,13 +147,34 @@ public class PaymentService {
         return !payments.isEmpty();
     }
     
-    
-    // 주문 생성 (오버로드 - 기존 호환성)
+
+    /**
+     * 주문 생성 (기존 호환성을 위한 오버로드 메서드)
+     *
+     * @param userId 사용자 ID
+     * @param totalAmount 총 주문 금액
+     * @param pointsUsed 사용할 적립금
+     * @param cardAmount 카드 결제 금액
+     * @return 생성된 주문 정보
+     */
     public Map<String, Object> createOrder(Long userId, Long totalAmount, Integer pointsUsed, Long cardAmount) {
         return createOrder(userId, totalAmount, pointsUsed, cardAmount, false);
     }
 
-    // 주문 생성
+    /**
+     * 주문 생성
+     *
+     * 새로운 주문을 생성하고 사용자의 적립금을 차감합니다.
+     * 망취소 테스트 모드를 지원합니다.
+     *
+     * @param userId 사용자 ID
+     * @param totalAmount 총 주문 금액
+     * @param pointsUsed 사용할 적립금
+     * @param cardAmount 카드 결제 금액
+     * @param isNetworkCancelTest 망취소 테스트 여부
+     * @return 생성된 주문 정보 (주문번호, 주문 ID 등)
+     * @throws IllegalArgumentException 사용자가 존재하지 않거나 적립금이 부족한 경우
+     */
     public Map<String, Object> createOrder(Long userId, Long totalAmount, Integer pointsUsed, Long cardAmount, Boolean isNetworkCancelTest) {
         logger.info("Creating order - userId: {}, totalAmount: {}, pointsUsed: {}, cardAmount: {}, isNetworkCancelTest: {}",
                    userId, totalAmount, pointsUsed, cardAmount, isNetworkCancelTest);
@@ -2791,7 +2831,17 @@ public class PaymentService {
         }
     }
 
-    // 망취소 기록 저장 (별도 트랜잭션)
+    /**
+     * 망취소 기록 저장 (별도 트랜잭션)
+     *
+     * 망취소 처리 후 별도의 취소 기록을 생성합니다.
+     * 원본 결제의 음수 금액으로 NETWORK_CANCEL 타입의 결제 기록을 생성하여
+     * 일반 취소와 구분할 수 있도록 합니다.
+     *
+     * @param originalPayment 원본 결제 정보
+     * @param networkCancelResult 망취소 처리 결과
+     * @param reason 망취소 사유
+     */
     @Transactional(propagation = Propagation.REQUIRES_NEW)
     public void saveNetworkCancelRecord(Payment originalPayment, Map<String, Object> networkCancelResult, String reason) {
         try {
@@ -2843,7 +2893,18 @@ public class PaymentService {
         }
     }
 
-    // 수동 망취소 실행
+    /**
+     * 수동 망취소 실행
+     *
+     * 주문번호를 기반으로 망취소(Network Cancel)를 수행합니다.
+     * 망취소는 PG사와의 통신 장애를 시뮬레이션하는 기능으로,
+     * 별도의 취소 기록을 생성하고 주문 상태를 NETWORK_CANCELLED로 변경합니다.
+     *
+     * @param orderNo 망취소할 주문번호
+     * @param reason 망취소 사유
+     * @param clientIp 클라이언트 IP 주소
+     * @return 망취소 처리 결과 (성공/실패, 메시지, 취소 금액 등)
+     */
     public Map<String, Object> performNetworkCancel(String orderNo, String reason, String clientIp) {
         try {
             logger.info("=== 수동 망취소 요청 - Order: {}, Reason: {} ===", orderNo, reason);
